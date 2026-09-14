@@ -26,6 +26,7 @@
   <a href="#features-at-a-glance">Features</a> ·
   <a href="#tool-profiles">Profiles</a> ·
   <a href="#core-tools">Tools</a> ·
+  <a href="#agent-interaction-benchmark">Benchmark</a> ·
   <a href="#security">Security</a> ·
   <a href="README.ar.md">العربية</a>
 </p>
@@ -463,6 +464,43 @@ Platform limits are reported rather than hidden:
 - Recording stop probes `/proc/<pid>/cmdline` for this session's `screenrecord` path (token match). Transient probe failures while the PID is still alive are treated as uncertain and still signaled so a live recording is not pulled mid-write.
 
 See [SECURITY.md](SECURITY.md) for reporting and deployment guidance.
+
+## Agent interaction benchmark
+
+This benchmark compares PolyScreen's structured Android automation surface with
+direct `adb` commands on an Android emulator. It uses Janan's **Add
+medication** button and name field, plus the Camera shutter, so the actions
+exercise navigation, semantic button discovery, text input, and photo capture.
+
+The run targeted `emulator-5554`, logical display `0` (1280×2856), and typed
+`PolyScreenTest`. All four tasks succeeded through both paths; both camera
+trials produced a JPEG in the emulator's `/sdcard/Pictures/` directory.
+
+Token counts use the `o200k_base` tokenizer and include the agent-visible
+request/command text plus textual tool results. MCP initialization bytes,
+model reasoning, and binary image bytes are excluded. The `adb` path used
+`uiautomator` XML for target discovery and verification; hard-coded
+coordinates would use fewer tokens but would be more brittle.
+
+| Task                     |      PolyScreen MCP |         Direct `adb` | Difference                                     | Ease of use                                                                |
+| ------------------------ | ------------------: | -------------------: | ---------------------------------------------- | -------------------------------------------------------------------------- |
+| Navigate to Janan        | 1 call / 230 tokens | 2 calls / 169 tokens | `adb` used 61 fewer tokens                     | PolyScreen resolves the activity automatically                             |
+| Click **Add medication** |             3 / 457 |            3 / 4,241 | PolyScreen used 89.2% fewer                    | PolyScreen returns a semantic match and tap plan                           |
+| Input `PolyScreenTest`   |             2 / 324 |            2 / 2,710 | PolyScreen used 88.0% fewer                    | PolyScreen provides a dedicated text operation and structured verification |
+| Take a picture           |             4 / 640 |            5 / 4,231 | PolyScreen used 84.9% fewer                    | PolyScreen finds the shutter semantically and targets the logical display  |
+| **Task total**           |      **10 / 1,651** |      **12 / 11,351** | **PolyScreen used 85.5% fewer (9,700 tokens)** | **PolyScreen was easier overall**                                          |
+
+The main difference is response shape: `mobile_ui_find` returns only the
+matching node and its resolved tap point, while the comparable `adb` workflow
+returns the full UI hierarchy for the agent to parse. In this single sequential
+run, measured call-time totals were about 15.0 seconds for PolyScreen and 14.0
+seconds for `adb`; latency is environment-dependent and was not the primary
+measure.
+
+PolyScreen has a one-time session cost: the `core` profile's 33-tool catalog
+and discovery calls consumed 12,503 text tokens in this run, compared with 113
+tokens for the two basic `adb` setup checks. This catalog cost is separate from
+the task table and is normally amortized across a session.
 
 ## Testing and development
 

@@ -1322,6 +1322,50 @@ export function createPolyScreenRuntime(
     );
 
     server.registerTool(
+      "mobile_input_key_sequence",
+      {
+        title: "Send a timed Android key sequence",
+        description:
+          "Send a timed sequence of Android keys and touchscreen taps in one call. Digits between actions are millisecond pauses, not a simultaneous chord. An x,y token is a tap; join points with + for a touch combo with no pause between them. Pass stepped.checks, one entry per action, to run each action on its own and poll for a UI node before continuing.",
+        inputSchema: z.object({
+          serial: serialSchema,
+          displayId: displayIdSchema,
+          source: z.enum(["keyboard", "dpad", "gamepad"]).default("gamepad"),
+          gapMs: z.number().int().min(0).max(5_000).default(300),
+          sequence: z.string().min(1).max(2_000),
+          stepped: z
+            .object({
+              timeoutMs: z.number().int().min(100).max(30_000).default(5_000),
+              pollMs: z.number().int().min(50).max(2_000).default(300),
+              checks: z
+                .array(
+                  z
+                    .object({
+                      text: z.string().min(1).optional(),
+                      contentDescription: z.string().min(1).optional(),
+                      resourceId: z.string().min(1).optional(),
+                      exact: z.boolean().default(false),
+                    })
+                    .nullable(),
+                )
+                .max(32),
+            })
+            .optional(),
+        }),
+        outputSchema: envelopeOutputSchema,
+        annotations: mutationAnnotations,
+      },
+      async ({ serial, displayId, source, gapMs, sequence, stepped }, ctx) => {
+        const result = await controller.inputKeySequence(
+          serial,
+          { displayId, source, gapMs, sequence, stepped },
+          ctx.mcpReq.signal,
+        );
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
       "mobile_input_text",
       {
         title: "Type Android text",

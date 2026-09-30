@@ -1,6 +1,6 @@
 {
   "name": "polyscreen-mcp",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Capability-driven Android automation MCP server with first-class multi-display and gamepad support",
   "type": "module",
   "license": "MPL-2.0",

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { abortableDelay } from "../utils/abortable-delay.js";
 import {
   AdbCommandError,
   AdbRunner,
@@ -21,6 +22,7 @@ import type {
   DeviceCapabilities,
   OperationEnvelope,
 } from "./types.js";
+import { findUiNodes, parseUiNodes } from "./ui.js";
 
 // mDNS serials renamed by Bonjour conflict resolution contain a space and
 // parentheses ("adb-XYZ (3)._adb-tls-connect._tcp"), so single inner spaces are
@@ -32,6 +34,37 @@ const SAFE_SERIAL = new RegExp(
 const SAFE_PACKAGE = /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+$/;
 const SAFE_COMPONENT = /^[A-Za-z0-9_.$]+\/[A-Za-z0-9_.$]+$/;
 const SAFE_KEY = /^(?:KEYCODE_)?[A-Z0-9_]+$|^\d{1,4}$/;
+const INPUT_SOURCES = ["keyboard", "dpad", "gamepad"] as const;
+const MAX_SEQUENCE_KEYS = 32;
+const MAX_TOUCH_COMBO_POINTS = 8;
+const MAX_SEQUENCE_DELAY_MS = 5_000;
+const MAX_SEQUENCE_DELAY_SUM_MS = 60_000;
+const KEY_SEQUENCE_TIMEOUT_PER_KEY_MS = 2_000;
+const MAX_KEY_SEQUENCE_TIMEOUT_MS =
+  MAX_SEQUENCE_DELAY_SUM_MS +
+  MAX_SEQUENCE_KEYS * KEY_SEQUENCE_TIMEOUT_PER_KEY_MS;
+const KEY_SEQUENCE_ALIASES: Readonly<Record<string, string>> = {
+  A: "BUTTON_A",
+  B: "BUTTON_B",
+  X: "BUTTON_X",
+  Y: "BUTTON_Y",
+  UP: "DPAD_UP",
+  DOWN: "DPAD_DOWN",
+  LEFT: "DPAD_LEFT",
+  RIGHT: "DPAD_RIGHT",
+  L1: "BUTTON_L1",
+  R1: "BUTTON_R1",
+  L2: "BUTTON_L2",
+  R2: "BUTTON_R2",
+  LB: "BUTTON_L1",
+  RB: "BUTTON_R1",
+  START: "BUTTON_START",
+  SELECT: "BUTTON_SELECT",
+  HOME: "HOME",
+  BACK: "BACK",
+};
+
+type InputSource = (typeof INPUT_SOURCES)[number];
 
 // `input` subcommand -> the capability flag parsed from `input` help.
 const INPUT_COMMAND_CAPABILITIES: Record<
@@ -51,9 +84,53 @@ const INPUT_COMMAND_CAPABILITIES: Record<
 export interface KeyInput {
   key: string;
   displayId: number;
-  source?: "keyboard" | "dpad" | "gamepad" | undefined;
+  source?: InputSource | undefined;
   action?: "press" | "long_press" | "double_tap" | undefined;
   durationMs?: number | undefined;
+}
+
+export type KeySequenceStep = {
+  delayAfterMs: number;
+} & ({ key: string; keyCode: string } | { x: number; y: number });
+
+export interface SequenceUiCheck {
+  text?: string | undefined;
+  contentDescription?: string | undefined;
+  resourceId?: string | undefined;
+  exact?: boolean | undefined;
+}
+
+export interface SequenceCheckReport {
+  index: number;
+  found: boolean;
+  attempts: number;
+  elapsedMs: number;
+}
+
+export interface KeySequenceInput {
+  displayId: number;
+  sequence: string;
+  source?: InputSource | undefined;
+  gapMs?: number | undefined;
+  /** Run each action on its own and poll for a UI node before the next one. */
+  stepped?:
+    | {
+        timeoutMs?: number | undefined;
+        pollMs?: number | undefined;
+        checks: Array<SequenceUiCheck | null>;
+      }
+    | undefined;
+}
+
+export interface KeySequenceResult {
+  source: InputSource;
+  displayId: number;
+  gapMs: number;
+  steps: readonly KeySequenceStep[];
+  stepped?: true;
+  completed?: boolean;
+  stoppedAt?: number;
+  checks?: Array<SequenceCheckReport | null>;
 }
 
 export class AndroidController {
@@ -662,6 +739,214 @@ export class AndroidController {
     return await this.mutate(serial, input.displayId, args, input, signal);
   }
 
+  async inputKeySequence(
+    serial: string,
+    input: KeySequenceInput,
+    signal?: AbortSignal,
+  ): Promise<OperationEnvelope<KeySequenceResult>> {
+    const source = input.source ?? "gamepad";
+    const gapMs = input.gapMs ?? 300;
+    const displayId = sequenceDisplayId(input.displayId);
+    assertInputSource(source);
+    const steps = parseKeySequence(input.sequence, gapMs);
+    if (input.stepped) {
+      assertSequenceChecks(steps.length, input.displayId, input.stepped);
+    }
+    const points = steps.flatMap((step) =>
+      isTapStep(step) ? [{ x: step.x, y: step.y }] : [],
+    );
+    const hasKey = steps.some((step) => !isTapStep(step));
+    const prepared = await this.prepareInput(
+      serial,
+      input.displayId,
+      hasKey
+        ? [source, "-d", displayId, "keyevent"]
+        : ["touchscreen", "-d", displayId, "tap"],
+      signal,
+      [],
+      points,
+    );
+    if (hasKey && points.length > 0) {
+      assertInputSupported(
+        await this.inspectDevice(serial, { signal }),
+        "touchscreen",
+        "tap",
+      );
+    }
+    if (input.stepped) {
+      return await this.playSteppedSequence(
+        serial,
+        input.displayId,
+        source,
+        gapMs,
+        displayId,
+        steps,
+        input.stepped,
+        prepared.inputArgs.includes("-d"),
+        prepared.warnings,
+        signal,
+      );
+    }
+    const script = buildKeySequenceScript(
+      source,
+      displayId,
+      steps,
+      prepared.inputArgs.includes("-d"),
+    );
+    const delaySum = steps.reduce((sum, step) => sum + step.delayAfterMs, 0);
+    const timeoutMs = Math.min(
+      delaySum + steps.length * KEY_SEQUENCE_TIMEOUT_PER_KEY_MS,
+      MAX_KEY_SEQUENCE_TIMEOUT_MS,
+    );
+    const result = await this.#queue.mutate(serial, () =>
+      this.adb.run(["shell", "sh", "-c", quoteRemoteShellArg(script)], {
+        serial,
+        signal,
+        timeoutMs,
+      }),
+    );
+    return this.envelope(
+      serial,
+      input.displayId,
+      "adb",
+      { source, displayId: input.displayId, gapMs, steps },
+      result.durationMs,
+      prepared.warnings,
+    );
+  }
+
+  private async playSteppedSequence(
+    serial: string,
+    logicalDisplayId: number,
+    source: InputSource,
+    gapMs: number,
+    displayId: string,
+    steps: readonly KeySequenceStep[],
+    stepped: NonNullable<KeySequenceInput["stepped"]>,
+    displayTargeting: boolean,
+    warnings: string[],
+    signal?: AbortSignal,
+  ): Promise<
+    OperationEnvelope<{
+      source: InputSource;
+      displayId: number;
+      gapMs: number;
+      steps: readonly KeySequenceStep[];
+      stepped: true;
+      completed: boolean;
+      stoppedAt?: number;
+      checks: Array<SequenceCheckReport | null>;
+    }>
+  > {
+    const timeoutMs = stepped.timeoutMs ?? 5_000;
+    const pollMs = stepped.pollMs ?? 300;
+    const played = await this.#queue.mutate(serial, async () => {
+      const started = performance.now();
+      const checks: Array<SequenceCheckReport | null> = [];
+      for (let index = 0; index < steps.length; index += 1) {
+        const step = steps[index];
+        if (!step) continue;
+        signal?.throwIfAborted();
+        await this.adb.run(
+          [
+            "shell",
+            "input",
+            ...sequenceInputArgv(source, displayId, step, displayTargeting),
+          ],
+          { serial, signal, timeoutMs: KEY_SEQUENCE_TIMEOUT_PER_KEY_MS },
+        );
+        if (step.delayAfterMs > 0) {
+          await abortableDelay(step.delayAfterMs, signal);
+        }
+        const check = stepped.checks[index] ?? null;
+        if (!check) {
+          checks.push(null);
+          continue;
+        }
+        const report = await this.pollForUi(
+          serial,
+          logicalDisplayId,
+          check,
+          timeoutMs,
+          pollMs,
+          signal,
+        );
+        checks.push({ index, ...report });
+        if (!report.found) {
+          return {
+            durationMs: Math.round(performance.now() - started),
+            checks,
+            completed: false as const,
+            stoppedAt: index,
+          };
+        }
+      }
+      return {
+        durationMs: Math.round(performance.now() - started),
+        checks,
+        completed: true as const,
+      };
+    });
+    const stopped = played.stoppedAt !== undefined;
+    return this.envelope(
+      serial,
+      logicalDisplayId,
+      "adb",
+      {
+        source,
+        displayId: logicalDisplayId,
+        gapMs,
+        steps,
+        stepped: true,
+        completed: played.completed,
+        checks: played.checks,
+        ...(stopped ? { stoppedAt: played.stoppedAt } : {}),
+      },
+      played.durationMs,
+      stopped
+        ? [
+            ...warnings,
+            `UI check failed after step ${played.stoppedAt}: ${describeUiCheck(stepped.checks[played.stoppedAt ?? 0])}`,
+          ]
+        : warnings,
+    );
+  }
+
+  private async pollForUi(
+    serial: string,
+    displayId: number,
+    query: SequenceUiCheck,
+    timeoutMs: number,
+    pollMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ found: boolean; attempts: number; elapsedMs: number }> {
+    const started = performance.now();
+    let attempts = 0;
+    while (true) {
+      signal?.throwIfAborted();
+      attempts += 1;
+      const nodes = parseUiNodes(
+        await this.uiSnapshot(serial, displayId, signal),
+      );
+      if (findUiNodes(nodes, query).length > 0) {
+        return {
+          found: true,
+          attempts,
+          elapsedMs: Math.round(performance.now() - started),
+        };
+      }
+      const elapsed = performance.now() - started;
+      if (elapsed >= timeoutMs) {
+        return {
+          found: false,
+          attempts,
+          elapsedMs: Math.round(elapsed),
+        };
+      }
+      await abortableDelay(Math.min(pollMs, timeoutMs - elapsed), signal);
+    }
+  }
+
   async inputText(
     serial: string,
     displayId: number,
@@ -900,6 +1185,38 @@ export class AndroidController {
     warnings: string[] = [],
     points: readonly { x: number; y: number }[] = [],
   ): Promise<OperationEnvelope<T>> {
+    const prepared = await this.prepareInput(
+      serial,
+      displayId,
+      inputArgs,
+      signal,
+      warnings,
+      points,
+    );
+    const result = await this.#queue.mutate(serial, () =>
+      this.adb.run(["shell", "input", ...prepared.inputArgs], {
+        serial,
+        signal,
+      }),
+    );
+    return this.envelope(
+      serial,
+      displayId,
+      "adb",
+      data,
+      result.durationMs,
+      prepared.warnings,
+    );
+  }
+
+  private async prepareInput(
+    serial: string,
+    displayId: number,
+    inputArgs: string[],
+    signal: AbortSignal | undefined,
+    warnings: string[],
+    points: readonly { x: number; y: number }[],
+  ): Promise<{ inputArgs: string[]; warnings: string[] }> {
     const display = await this.requireDisplay(serial, displayId, signal);
     assertPointsOnDisplay(display, points);
     const capabilities = await this.inspectDevice(serial, { signal });
@@ -907,27 +1224,11 @@ export class AndroidController {
     const commandIndex = inputArgs.findIndex((value) =>
       Object.hasOwn(INPUT_COMMAND_CAPABILITIES, value.toLowerCase()),
     );
-    const command = inputArgs[commandIndex]?.toLowerCase();
-    const commandKey = command
-      ? INPUT_COMMAND_CAPABILITIES[command]
-      : undefined;
-    const advertisedCommands = Object.values(capabilities.input.commands).some(
-      Boolean,
+    assertInputSupported(
+      capabilities,
+      source,
+      inputArgs[commandIndex]?.toLowerCase(),
     );
-    if (
-      commandKey &&
-      advertisedCommands &&
-      !capabilities.input.commands[commandKey]
-    ) {
-      throw new Error(`Device input command is not supported: ${command}`);
-    }
-    if (
-      source &&
-      capabilities.input.sources.length > 0 &&
-      !capabilities.input.sources.includes(source)
-    ) {
-      throw new Error(`Device input source is not supported: ${source}`);
-    }
     if (!capabilities.input.displayTargeting) {
       if (displayId !== 0) {
         throw new Error(
@@ -941,17 +1242,7 @@ export class AndroidController {
         "Device input help does not advertise display targeting; used the default-display form",
       ];
     }
-    const result = await this.#queue.mutate(serial, () =>
-      this.adb.run(["shell", "input", ...inputArgs], { serial, signal }),
-    );
-    return this.envelope(
-      serial,
-      displayId,
-      "adb",
-      data,
-      result.durationMs,
-      warnings,
-    );
+    return { inputArgs, warnings };
   }
 
   private envelope<T>(
@@ -1089,6 +1380,229 @@ export class AndroidController {
       return { supported: false, output: "", exitCode: -1 };
     }
   }
+}
+
+function assertInputSupported(
+  capabilities: DeviceCapabilities,
+  source: string | undefined,
+  command: string | undefined,
+): void {
+  const normalized = command?.toLowerCase();
+  const commandKey = normalized
+    ? INPUT_COMMAND_CAPABILITIES[normalized]
+    : undefined;
+  const advertisedCommands = Object.values(capabilities.input.commands).some(
+    Boolean,
+  );
+  if (
+    commandKey &&
+    advertisedCommands &&
+    !capabilities.input.commands[commandKey]
+  ) {
+    throw new Error(`Device input command is not supported: ${normalized}`);
+  }
+  if (
+    source &&
+    capabilities.input.sources.length > 0 &&
+    !capabilities.input.sources.includes(source)
+  ) {
+    throw new Error(`Device input source is not supported: ${source}`);
+  }
+}
+
+function sequenceKeyCode(step: { key: string; keyCode: string }): string {
+  if (!/^KEYCODE_[A-Z0-9_]+$/.test(step.keyCode)) {
+    throw new Error(`Invalid Android keycode: ${step.key}`);
+  }
+  return step.keyCode;
+}
+
+function assertInputSource(source: string): asserts source is InputSource {
+  if (!(INPUT_SOURCES as readonly string[]).includes(source)) {
+    throw new Error(`Device input source is not supported: ${source}`);
+  }
+}
+
+function sequenceDisplayId(displayId: number): string {
+  if (!Number.isInteger(displayId) || displayId < 0) {
+    throw new Error(`Invalid logical display id: ${displayId}`);
+  }
+  return String(displayId);
+}
+
+function parseKeySequence(sequence: string, gapMs: number): KeySequenceStep[] {
+  if (sequence.length < 1 || sequence.length > 2_000) {
+    throw new Error("Key sequence must be 1..2000 characters");
+  }
+  if (!Number.isInteger(gapMs) || gapMs < 0 || gapMs > MAX_SEQUENCE_DELAY_MS) {
+    throw new Error("Key sequence gap must be 0..5000ms");
+  }
+  const tokens = sequence
+    .trim()
+    .split(/\s+/)
+    .filter((token) => token.length > 0);
+  if (tokens.length === 0) throw new Error("Key sequence is empty");
+
+  const steps: KeySequenceStep[] = [];
+  let pendingDelay: number | undefined;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index] ?? "";
+    if (/^\d+$/.test(token)) {
+      if (steps.length === 0) {
+        throw new Error("Key sequence cannot start with a delay");
+      }
+      if (pendingDelay !== undefined) {
+        throw new Error("Key sequence cannot contain consecutive delays");
+      }
+      if (index === tokens.length - 1) {
+        throw new Error("Key sequence cannot end with a delay");
+      }
+      pendingDelay = parseSequenceDelay(token);
+      continue;
+    }
+    const previous = steps[steps.length - 1];
+    if (previous) previous.delayAfterMs = pendingDelay ?? gapMs;
+    pendingDelay = undefined;
+    for (const action of sequenceActions(token)) {
+      steps.push({ ...action, delayAfterMs: 0 });
+      if (steps.length > MAX_SEQUENCE_KEYS) {
+        throw new Error("Key sequence exceeds 32 steps");
+      }
+    }
+  }
+
+  const delaySum = steps.reduce((sum, step) => sum + step.delayAfterMs, 0);
+  if (delaySum > MAX_SEQUENCE_DELAY_SUM_MS) {
+    throw new Error("Key sequence delays exceed 60000ms");
+  }
+  return steps;
+}
+
+function parseSequenceDelay(token: string): number {
+  if (!/^\d{1,4}$/.test(token)) {
+    throw new Error(`Key sequence delay must be 0..5000ms: ${token}`);
+  }
+  const delayMs = Number(token);
+  if (delayMs > MAX_SEQUENCE_DELAY_MS) {
+    throw new Error(`Key sequence delay must be 0..5000ms: ${token}`);
+  }
+  return delayMs;
+}
+
+function sequenceActions(
+  token: string,
+): Array<{ key: string; keyCode: string } | { x: number; y: number }> {
+  if (token.includes(",")) return parseTouchCombo(token);
+  return [{ key: token, keyCode: resolveSequenceKeyCode(token) }];
+}
+
+function parseTouchCombo(token: string): { x: number; y: number }[] {
+  const parts = token.split("+");
+  if (parts.length > MAX_TOUCH_COMBO_POINTS) {
+    throw new Error(`Touch combo exceeds ${MAX_TOUCH_COMBO_POINTS} points`);
+  }
+  return parts.map((part) => {
+    const match = /^(\d{1,5}),(\d{1,5})$/.exec(part);
+    if (!match?.[1] || !match[2])
+      throw new Error(`Invalid touch point: ${token}`);
+    return { x: Number(match[1]), y: Number(match[2]) };
+  });
+}
+
+function isTapStep(
+  step: KeySequenceStep,
+): step is KeySequenceStep & { x: number; y: number } {
+  return "x" in step;
+}
+
+function resolveSequenceKeyCode(token: string): string {
+  const folded = token.toUpperCase();
+  const alias = KEY_SEQUENCE_ALIASES[folded];
+  if (alias) return `KEYCODE_${alias}`;
+  if (/^\d+$/.test(folded) || !SAFE_KEY.test(folded)) {
+    throw new Error(`Invalid Android keycode: ${token}`);
+  }
+  return folded.startsWith("KEYCODE_") ? folded : `KEYCODE_${folded}`;
+}
+
+function sequenceInputArgv(
+  source: InputSource,
+  displayId: string,
+  step: KeySequenceStep,
+  displayTargeting: boolean,
+): string[] {
+  const target = displayTargeting ? ["-d", displayId] : [];
+  return isTapStep(step)
+    ? ["touchscreen", ...target, "tap", String(step.x), String(step.y)]
+    : [source, ...target, "keyevent", sequenceKeyCode(step)];
+}
+
+function buildKeySequenceScript(
+  source: InputSource,
+  displayId: string,
+  steps: readonly KeySequenceStep[],
+  displayTargeting: boolean,
+): string {
+  return steps
+    .map((step) => {
+      const command = [
+        "input",
+        ...sequenceInputArgv(source, displayId, step, displayTargeting),
+      ].join(" ");
+      if (step.delayAfterMs <= 0) return command;
+      return `${command}; sleep ${(step.delayAfterMs / 1000).toFixed(3)}`;
+    })
+    .join("; ");
+}
+
+function assertSequenceChecks(
+  actionCount: number,
+  displayId: number,
+  stepped: NonNullable<KeySequenceInput["stepped"]>,
+): void {
+  const timeoutMs = stepped.timeoutMs ?? 5_000;
+  const pollMs = stepped.pollMs ?? 300;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30_000) {
+    throw new Error("UI check timeout must be 100..30000ms");
+  }
+  if (!Number.isInteger(pollMs) || pollMs < 50 || pollMs > 2_000) {
+    throw new Error("UI check poll interval must be 50..2000ms");
+  }
+  if (stepped.checks.length !== actionCount) {
+    throw new Error(
+      `UI checks must align with the ${actionCount} sequence actions`,
+    );
+  }
+  let needsUi = false;
+  for (const check of stepped.checks) {
+    if (!check) continue;
+    needsUi = true;
+    if (!check.text && !check.contentDescription && !check.resourceId) {
+      throw new Error(
+        "UI check needs text, content description, or resource id",
+      );
+    }
+  }
+  if (needsUi && displayId !== 0) {
+    throw new Error(
+      "Portable uiautomator cannot select a non-default display; enable the instrumentation backend",
+    );
+  }
+}
+
+function describeUiCheck(check: SequenceUiCheck | null | undefined): string {
+  if (!check) return "missing check";
+  const parts: string[] = [];
+  if (check.text) parts.push(`text ${JSON.stringify(check.text)}`);
+  if (check.contentDescription) {
+    parts.push(
+      `content description ${JSON.stringify(check.contentDescription)}`,
+    );
+  }
+  if (check.resourceId) {
+    parts.push(`resource id ${JSON.stringify(check.resourceId)}`);
+  }
+  return parts.join(", ");
 }
 
 function isTcpSerial(serial: string): boolean {

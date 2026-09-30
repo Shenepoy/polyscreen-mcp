@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { quoteRemoteShellArg } from "../src/android/adb-runner.js";
 import { AndroidController } from "../src/android/android-controller.js";
 import { addConnectedDevice, FakeAdbRunner } from "./fake-adb.js";
 
@@ -309,4 +310,369 @@ describe("AndroidController", () => {
       new AndroidController(runner).tap(SERIAL, 0, 10, 20),
     ).rejects.toThrow(/not supported: tap/);
   });
+
+  it("sends a timed key sequence as one remote shell", async () => {
+    const sequence =
+      "UP 350 X 400 DOWN 300 A 700 R1 R1 RIGHT RIGHT A 700 START 450 A";
+    const script = [
+      "input gamepad -d 0 keyevent KEYCODE_DPAD_UP; sleep 0.350",
+      "input gamepad -d 0 keyevent KEYCODE_BUTTON_X; sleep 0.400",
+      "input gamepad -d 0 keyevent KEYCODE_DPAD_DOWN; sleep 0.300",
+      "input gamepad -d 0 keyevent KEYCODE_BUTTON_A; sleep 0.700",
+      "input gamepad -d 0 keyevent KEYCODE_BUTTON_R1; sleep 0.300",
+      "input gamepad -d 0 keyevent KEYCODE_BUTTON_R1; sleep 0.300",
+      "input gamepad -d 0 keyevent KEYCODE_DPAD_RIGHT; sleep 0.300",
+      "input gamepad -d 0 keyevent KEYCODE_DPAD_RIGHT; sleep 0.300",
+      "input gamepad -d 0 keyevent KEYCODE_BUTTON_A; sleep 0.700",
+      "input gamepad -d 0 keyevent KEYCODE_BUTTON_START; sleep 0.450",
+      "input gamepad -d 0 keyevent KEYCODE_BUTTON_A",
+    ].join("; ");
+    const signal = new AbortController().signal;
+    const runner = capabilityRunner().respond(
+      ["shell", "sh", "-c", quoteRemoteShellArg(script)],
+      "",
+      { serial: SERIAL },
+    );
+
+    const result = await new AndroidController(runner).inputKeySequence(
+      SERIAL,
+      { displayId: 0, sequence },
+      signal,
+    );
+
+    const shells = runner.calls.filter((call) => call.args[1] === "sh");
+    expect(shells).toEqual([
+      {
+        args: ["shell", "sh", "-c", quoteRemoteShellArg(script)],
+        options: { serial: SERIAL, signal, timeoutMs: 26_100 },
+      },
+    ]);
+    expect(
+      runner.calls.filter(
+        (call) => call.args[1] === "input" && call.args.includes("keyevent"),
+      ),
+    ).toEqual([]);
+    expect(result.data).toEqual({
+      source: "gamepad",
+      displayId: 0,
+      gapMs: 300,
+      steps: [
+        { key: "UP", keyCode: "KEYCODE_DPAD_UP", delayAfterMs: 350 },
+        { key: "X", keyCode: "KEYCODE_BUTTON_X", delayAfterMs: 400 },
+        { key: "DOWN", keyCode: "KEYCODE_DPAD_DOWN", delayAfterMs: 300 },
+        { key: "A", keyCode: "KEYCODE_BUTTON_A", delayAfterMs: 700 },
+        { key: "R1", keyCode: "KEYCODE_BUTTON_R1", delayAfterMs: 300 },
+        { key: "R1", keyCode: "KEYCODE_BUTTON_R1", delayAfterMs: 300 },
+        { key: "RIGHT", keyCode: "KEYCODE_DPAD_RIGHT", delayAfterMs: 300 },
+        { key: "RIGHT", keyCode: "KEYCODE_DPAD_RIGHT", delayAfterMs: 300 },
+        { key: "A", keyCode: "KEYCODE_BUTTON_A", delayAfterMs: 700 },
+        { key: "START", keyCode: "KEYCODE_BUTTON_START", delayAfterMs: 450 },
+        { key: "A", keyCode: "KEYCODE_BUTTON_A", delayAfterMs: 0 },
+      ],
+    });
+  });
+
+  it("rejects an invalid key sequence before calling adb", async () => {
+    const runner = capabilityRunner();
+    const controller = new AndroidController(runner);
+    const tooManyKeys = Array.from({ length: 33 }, () => "A").join(" ");
+    const delaysTooLong = Array.from({ length: 14 }, () => "A").join(" ");
+
+    await expect(
+      controller.inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: "UP not-a-key",
+      }),
+    ).rejects.toThrow("Invalid Android keycode: not-a-key");
+    await expect(
+      controller.inputKeySequence(SERIAL, { displayId: 0, sequence: "350 UP" }),
+    ).rejects.toThrow(/cannot start with a delay/);
+    await expect(
+      controller.inputKeySequence(SERIAL, { displayId: 0, sequence: "A 100" }),
+    ).rejects.toThrow(/cannot end with a delay/);
+    await expect(
+      controller.inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: "A 100 200 B",
+      }),
+    ).rejects.toThrow(/consecutive delays/);
+    await expect(
+      controller.inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: tooManyKeys,
+      }),
+    ).rejects.toThrow(/exceeds 32 steps/);
+    await expect(
+      controller.inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: "1,2,3",
+      }),
+    ).rejects.toThrow("Invalid touch point: 1,2,3");
+    await expect(
+      controller.inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: Array.from({ length: 9 }, (_, index) => `${index},1`).join(
+          "+",
+        ),
+      }),
+    ).rejects.toThrow(/Touch combo exceeds 8 points/);
+    await expect(
+      controller.inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: delaysTooLong,
+        gapMs: 5_000,
+      }),
+    ).rejects.toThrow(/exceed 60000ms/);
+    expect(runner.calls).toEqual([]);
+  });
+
+  it("rejects a key sequence when the device does not advertise keyevent", async () => {
+    const runner = capabilityRunner().respond(
+      ["shell", "input"],
+      INPUT_HELP.replace("keyevent", "removed"),
+      { serial: SERIAL },
+    );
+
+    await expect(
+      new AndroidController(runner).inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: "A B",
+      }),
+    ).rejects.toThrow("Device input command is not supported: keyevent");
+    expect(runner.calls.some((call) => call.args[1] === "sh")).toBe(false);
+  });
+
+  it("omits display targeting on the default display when input help lacks it", async () => {
+    const script =
+      "input gamepad keyevent KEYCODE_BUTTON_A; sleep 0.300; input gamepad keyevent KEYCODE_BUTTON_B";
+    const runner = capabilityRunner().respond(
+      ["shell", "input"],
+      INPUT_HELP.replace("[-d DISPLAY_ID] ", ""),
+      { serial: SERIAL },
+    );
+    runner.respond(["shell", "sh", "-c", quoteRemoteShellArg(script)], "", {
+      serial: SERIAL,
+    });
+
+    const result = await new AndroidController(runner).inputKeySequence(
+      SERIAL,
+      { displayId: 0, sequence: "A B" },
+    );
+
+    expect(result.warnings).toEqual([
+      "Device input help does not advertise display targeting; used the default-display form",
+    ]);
+    await expect(
+      new AndroidController(runner).inputKeySequence(SERIAL, {
+        displayId: 4,
+        sequence: "A",
+      }),
+    ).rejects.toThrow(
+      "This device input implementation cannot target non-default displays",
+    );
+  });
+
+  it("sends a touch combo inside a timed sequence as one remote shell", async () => {
+    const script = [
+      "input gamepad -d 0 keyevent KEYCODE_DPAD_UP; sleep 0.350",
+      "input touchscreen -d 0 tap 100 200",
+      "input touchscreen -d 0 tap 300 400; sleep 0.400",
+      "input gamepad -d 0 keyevent KEYCODE_BUTTON_A",
+    ].join("; ");
+    const runner = capabilityRunner().respond(
+      ["shell", "sh", "-c", quoteRemoteShellArg(script)],
+      "",
+      { serial: SERIAL },
+    );
+
+    const result = await new AndroidController(runner).inputKeySequence(
+      SERIAL,
+      { displayId: 0, sequence: "UP 350 100,200+300,400 400 A" },
+    );
+
+    expect(runner.calls.filter((call) => call.args[1] === "sh")).toEqual([
+      {
+        args: ["shell", "sh", "-c", quoteRemoteShellArg(script)],
+        options: { serial: SERIAL, timeoutMs: 8_750 },
+      },
+    ]);
+    expect(result.data.steps).toEqual([
+      { key: "UP", keyCode: "KEYCODE_DPAD_UP", delayAfterMs: 350 },
+      { x: 100, y: 200, delayAfterMs: 0 },
+      { x: 300, y: 400, delayAfterMs: 400 },
+      { key: "A", keyCode: "KEYCODE_BUTTON_A", delayAfterMs: 0 },
+    ]);
+  });
+
+  it("sends a tap sequence when the device does not advertise keyevent", async () => {
+    const script =
+      "input touchscreen -d 0 tap 10 20; sleep 0.300; input touchscreen -d 0 tap 30 40";
+    const runner = capabilityRunner()
+      .respond(["shell", "input"], INPUT_HELP.replace("keyevent", "removed"), {
+        serial: SERIAL,
+      })
+      .respond(["shell", "sh", "-c", quoteRemoteShellArg(script)], "", {
+        serial: SERIAL,
+      });
+
+    const result = await new AndroidController(runner).inputKeySequence(
+      SERIAL,
+      { displayId: 0, sequence: "10,20 30,40" },
+    );
+
+    expect(result.data.steps).toEqual([
+      { x: 10, y: 20, delayAfterMs: 300 },
+      { x: 30, y: 40, delayAfterMs: 0 },
+    ]);
+  });
+
+  it("rejects a touch sequence the device cannot tap, and points outside the display", async () => {
+    const unsupported = capabilityRunner().respond(
+      ["shell", "input"],
+      INPUT_HELP.replace("tap <x> <y>", ""),
+      { serial: SERIAL },
+    );
+    await expect(
+      new AndroidController(unsupported).inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: "A 100,200",
+      }),
+    ).rejects.toThrow("Device input command is not supported: tap");
+    expect(unsupported.calls.some((call) => call.args[1] === "sh")).toBe(false);
+
+    const runner = capabilityRunner();
+    await expect(
+      new AndroidController(runner).inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: "2000,20",
+      }),
+    ).rejects.toThrow(/outside display 0, which is 1920x1080/);
+    expect(runner.calls.some((call) => call.args[1] === "sh")).toBe(false);
+  });
+
+  it("steps through actions and continues after the UI node appears", async () => {
+    const runner = capabilityRunner()
+      .respond(
+        [
+          "shell",
+          "input",
+          "gamepad",
+          "-d",
+          "0",
+          "keyevent",
+          "KEYCODE_BUTTON_A",
+        ],
+        "",
+        { serial: SERIAL },
+      )
+      .respond(
+        [
+          "shell",
+          "input",
+          "gamepad",
+          "-d",
+          "0",
+          "keyevent",
+          "KEYCODE_BUTTON_B",
+        ],
+        "",
+        { serial: SERIAL },
+      );
+
+    const result = await new FixedUiController(
+      runner,
+      LIBRARY_XML,
+    ).inputKeySequence(SERIAL, {
+      displayId: 0,
+      sequence: "A B",
+      gapMs: 0,
+      stepped: {
+        timeoutMs: 500,
+        pollMs: 50,
+        checks: [null, { text: "Library" }],
+      },
+    });
+
+    expect(keyEvents(runner)).toEqual(["KEYCODE_BUTTON_A", "KEYCODE_BUTTON_B"]);
+    expect(runner.calls.some((call) => call.args[1] === "sh")).toBe(false);
+    expect(result.data.completed).toBe(true);
+    expect(result.data.stoppedAt).toBeUndefined();
+    expect(result.data.checks?.[1]).toMatchObject({
+      index: 1,
+      found: true,
+      attempts: 1,
+    });
+  });
+
+  it("stops a stepped sequence when the UI check does not match", async () => {
+    const runner = capabilityRunner().respond(
+      ["shell", "input", "gamepad", "-d", "0", "keyevent", "KEYCODE_BUTTON_A"],
+      "",
+      { serial: SERIAL },
+    );
+
+    const result = await new FixedUiController(
+      runner,
+      LIBRARY_XML,
+    ).inputKeySequence(SERIAL, {
+      displayId: 0,
+      sequence: "A B",
+      gapMs: 0,
+      stepped: {
+        timeoutMs: 100,
+        pollMs: 50,
+        checks: [{ text: "Missing" }, { text: "Library" }],
+      },
+    });
+
+    expect(keyEvents(runner)).toEqual(["KEYCODE_BUTTON_A"]);
+    expect(result.data.completed).toBe(false);
+    expect(result.data.stoppedAt).toBe(0);
+    expect(result.warnings.join("\n")).toContain('text "Missing"');
+  });
+
+  it("rejects a stepped UI plan before calling adb", async () => {
+    const runner = capabilityRunner();
+    const controller = new AndroidController(runner);
+
+    await expect(
+      controller.inputKeySequence(SERIAL, {
+        displayId: 0,
+        sequence: "A B",
+        stepped: { checks: [null] },
+      }),
+    ).rejects.toThrow("UI checks must align with the 2 sequence actions");
+    await expect(
+      controller.inputKeySequence(SERIAL, {
+        displayId: 4,
+        sequence: "A",
+        stepped: { checks: [{ text: "Library" }] },
+      }),
+    ).rejects.toThrow(/non-default display/);
+    expect(runner.calls).toEqual([]);
+  });
 });
+
+const LIBRARY_XML = `<?xml version="1.0"?>
+<hierarchy>
+  <node text="Library" resource-id="com.example:id/library" class="android.widget.TextView" bounds="[10,20][210,120]" />
+</hierarchy>`;
+
+class FixedUiController extends AndroidController {
+  constructor(
+    adb: FakeAdbRunner,
+    private readonly xml: string,
+  ) {
+    super(adb);
+  }
+
+  override async uiSnapshot(): Promise<string> {
+    return this.xml;
+  }
+}
+
+function keyEvents(runner: FakeAdbRunner): string[] {
+  return runner.calls
+    .filter((call) => call.args.includes("keyevent"))
+    .map((call) => call.args.at(-1) ?? "");
+}

@@ -118,7 +118,7 @@ The default `core` profile is deliberately compact. Additional profiles advertis
 Stdio launch (pin the published version):
 
 ```text
-npx -y polyscreen-mcp@0.7.0 --profile core diagnostics
+npx -y polyscreen-mcp@0.8.0 --profile core diagnostics
 ```
 
 `diagnostics` is required for logcat start/stop, activity tops, wake, and night-mode tools. After editing config or reconnecting, call `mobile_server_info` once and confirm `version`, `toolCount`, and detective tools match a fresh `tools/list`. Prefer an MCP host that speaks `2026-07-28` so the client negotiates the modern era instead of falling back to 2025 `initialize`.
@@ -144,7 +144,7 @@ Same `mcpServers` shape (merge into the existing object):
   "mcpServers": {
     "polyscreen": {
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.7.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -162,7 +162,7 @@ Workspace `.vscode/mcp.json` — note the `servers` root key (not `mcpServers`):
     "polyscreen": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.7.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -174,7 +174,7 @@ Preferred: workspace `.continue/mcpServers/polyscreen.yaml` (Continue also accep
 
 ```yaml
 name: PolyScreen MCP
-version: 0.7.0
+version: 0.8.0
 schema: v1
 mcpServers:
   - name: polyscreen
@@ -182,7 +182,7 @@ mcpServers:
     command: npx
     args:
       - -y
-      - polyscreen-mcp@0.7.0
+      - polyscreen-mcp@0.8.0
       - --profile
       - core
       - diagnostics
@@ -197,7 +197,7 @@ mcpServers:
   "context_servers": {
     "polyscreen": {
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.7.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -228,7 +228,7 @@ Endpoint: `http://127.0.0.1:3300/mcp`. HTTP always binds to loopback, validates 
 - `mobile_artifacts_list` / `mobile_artifacts_prune`
 - `mobile_ui_snapshot` / `mobile_ui_find` / `mobile_ui_wait`
 - `mobile_input_tap` / `mobile_input_swipe` / `mobile_input_drag`
-- `mobile_input_key` / `mobile_input_key_combination` / `mobile_input_text`
+- `mobile_input_key` / `mobile_input_key_sequence` / `mobile_input_key_combination` / `mobile_input_text`. `mobile_input_key_sequence` sends a timed sequence: digits between actions are millisecond pauses, not a simultaneous chord, and `x,y` tokens are taps (`x,y+x,y` is a touch combo with no pause between points). `stepped.checks` runs that walk one action at a time and polls for a UI node before the next action.
 - `mobile_app_inspect` / `mobile_app_launch` / `mobile_app_stop` / `mobile_app_relaunch_on_displays`
 - `mobile_app_install` / `mobile_app_uninstall`
 

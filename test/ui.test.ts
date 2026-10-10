@@ -4,6 +4,7 @@ import {
   findUiNodes,
   parseUiNodes,
   planTap,
+  uiNodesFromCompanion,
   withTapPlans,
 } from "../src/android/ui.js";
 
@@ -294,5 +295,39 @@ describe("tap planning", () => {
     expect(matches[0]?.occludedBy?.resourceId).toBe(
       "com.android.settings:id/search_plate",
     );
+  });
+
+  it("paints a companion child above its parent", () => {
+    const nodes = uiNodesFromCompanion({
+      nodes: [
+        {
+          parentIndex: -1,
+          drawingOrder: 5,
+          className: "root",
+          clickable: true,
+          bounds: { left: 0, top: 0, right: 10, bottom: 10 },
+        },
+        {
+          parentIndex: 0,
+          drawingOrder: 1,
+          className: "child",
+          clickable: true,
+          bounds: { left: 0, top: 0, right: 10, bottom: 10 },
+        },
+      ],
+    });
+
+    expect(nodes[1]?.paintIndex).toBeGreaterThan(nodes[0]?.paintIndex ?? 0);
+  });
+
+  it("keeps companion window order when root drawing orders disagree", () => {
+    const nodes = uiNodesFromCompanion({
+      nodes: [
+        { parentIndex: -1, drawingOrder: 2, className: "bottom" },
+        { parentIndex: -1, drawingOrder: 1, className: "top" },
+      ],
+    });
+
+    expect(nodes[1]?.paintIndex).toBeGreaterThan(nodes[0]?.paintIndex ?? 0);
   });
 });

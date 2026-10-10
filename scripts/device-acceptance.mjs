@@ -67,6 +67,11 @@ try {
       state: display.state,
     });
     assert(capture.sizeBytes > 8, `Display ${displayId} capture was empty`);
+    assert(
+      capture.coordinateSpace?.imageWidth > 0 &&
+        capture.coordinateSpace?.imageHeight > 0,
+      `Display ${displayId} capture has no coordinate space`,
+    );
     assert(capture.artifactUri, `Display ${displayId} capture was not saved`);
     const resource = await client.readResource({ uri: capture.artifactUri });
     assert(
@@ -120,6 +125,37 @@ try {
     includeDisabled: true,
   });
   summary.thirdPartyPackages = packages.packages.length;
+
+  const foreground = await call("mobile_app_foreground", { serial });
+  assert(foreground.source, "Foreground app did not name a source");
+  const orientation = await call("mobile_orientation", {
+    serial,
+    displayId: displayIds[0] ?? 0,
+    action: "get",
+  });
+  assert(
+    orientation.mode === "free" || orientation.mode === "lock",
+    "Orientation get did not return a mode",
+  );
+  const fold = await call("mobile_device_fold", { serial });
+  assert(
+    typeof fold.foldable === "boolean",
+    "Fold get did not return foldable",
+  );
+  const clipboard = await call("mobile_clipboard", { serial, action: "get" });
+  assert(
+    typeof clipboard.readable === "boolean",
+    "Clipboard get did not return readable",
+  );
+  const crashes = await call("mobile_crashes_list", { serial, limit: 5 });
+  assert(Array.isArray(crashes.entries), "Crash list did not return entries");
+  summary.deviceState = {
+    foreground: foreground.source,
+    orientation: orientation.mode,
+    foldable: fold.foldable,
+    clipboardReadable: clipboard.readable,
+    crashes: crashes.entries.length,
+  };
 
   if (packageName) {
     const app = await call("mobile_app_inspect", { serial, packageName });

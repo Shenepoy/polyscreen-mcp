@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { quoteRemoteShellArg } from "../src/android/adb-runner.js";
-import { AndroidController } from "../src/android/android-controller.js";
+import {
+  AndroidController,
+  buildDoubleTapScript,
+} from "../src/android/android-controller.js";
 import { addConnectedDevice, FakeAdbRunner } from "./fake-adb.js";
 
 const SERIAL = "serial-1";
@@ -281,6 +284,111 @@ describe("AndroidController", () => {
     const result = await new AndroidController(runner).tap(SERIAL, 0, 10, 20);
 
     expect(result.data).toEqual({ x: 10, y: 20 });
+  });
+
+  it("double-taps in one on-device motion script", async () => {
+    const script = buildDoubleTapScript(true, 0, 10, 20, 100);
+    const runner = capabilityRunner().respond(
+      ["shell", "sh", "-c", quoteRemoteShellArg(script)],
+      "",
+      { serial: SERIAL },
+    );
+
+    const result = await new AndroidController(runner).doubleTap(
+      SERIAL,
+      0,
+      10,
+      20,
+      100,
+    );
+
+    expect(result.data).toEqual({ x: 10, y: 20, gapMs: 100 });
+    expect(script).toBe(
+      "input touchscreen -d 0 tap 10 20 && sleep 0.100 && input touchscreen -d 0 tap 10 20",
+    );
+    expect(runner.calls.filter((call) => call.args[1] === "sh")).toHaveLength(
+      1,
+    );
+  });
+
+  it("taps a point and types in one device turn", async () => {
+    const runner = capabilityRunner()
+      .respond(
+        ["shell", "input", "touchscreen", "-d", "0", "tap", "10", "20"],
+        "",
+        { serial: SERIAL },
+      )
+      .respond(
+        [
+          "shell",
+          "input",
+          "keyboard",
+          "-d",
+          "0",
+          "text",
+          quoteRemoteShellArg("hi"),
+        ],
+        "",
+        { serial: SERIAL },
+      );
+
+    const result = await new AndroidController(runner).tapAndType(
+      SERIAL,
+      0,
+      10,
+      20,
+      "hi",
+    );
+
+    expect(result.data).toEqual({ text: "hi", unicodeReliable: false });
+    expect(
+      runner.calls
+        .filter((call) => call.args[1] === "input" && call.args.length > 2)
+        .map((call) => call.args[5]),
+    ).toEqual(["tap", "text"]);
+  });
+
+  it("long-presses by swiping a point onto itself", async () => {
+    const runner = capabilityRunner().respond(
+      [
+        "shell",
+        "input",
+        "touchscreen",
+        "-d",
+        "0",
+        "swipe",
+        "10",
+        "20",
+        "10",
+        "20",
+        "800",
+      ],
+      "",
+      { serial: SERIAL },
+    );
+
+    const result = await new AndroidController(runner).longPress(
+      SERIAL,
+      0,
+      10,
+      20,
+      800,
+    );
+
+    expect(result.data).toEqual({ x: 10, y: 20, durationMs: 800 });
+  });
+
+  it("reads the focused package for a logical display", async () => {
+    const result = await new AndroidController(displayRunner()).foregroundApp(
+      SERIAL,
+      0,
+    );
+
+    expect(result).toMatchObject({
+      source: "window-focus",
+      packageName: "com.game",
+      activity: "com.game/.MainActivity",
+    });
   });
 
   // `input tap` exits 0 for off-screen points and drops the event, which reads

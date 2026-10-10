@@ -43,6 +43,17 @@ describe("MCP server contract", () => {
     expect(names).toContain("mobile_default_app_get");
     expect(names).toContain("mobile_default_app_set");
     expect(names).toContain("mobile_default_app_clear");
+    expect(names).toContain("mobile_input_double_tap");
+    expect(names).toContain("mobile_input_long_press");
+    expect(names).toContain("mobile_batch");
+    expect(names).toContain("mobile_app_foreground");
+    expect(names).toContain("mobile_open_url");
+    expect(names).toContain("mobile_orientation");
+    expect(names).toContain("mobile_device_fold");
+    expect(names).toContain("mobile_location");
+    expect(names).toContain("mobile_clipboard");
+    expect(names).toContain("mobile_crashes_list");
+    expect(names).toContain("mobile_crash_get");
     expect(names).toContain("mobile_notifications_list");
     expect(names).toContain("mobile_notification_get");
     expect(names).toContain("mobile_notification_post");

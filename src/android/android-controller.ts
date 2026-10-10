@@ -7,6 +7,7 @@ import {
   quoteRemoteShellArg,
 } from "./adb-runner.js";
 import { DeviceQueue } from "./device-queue.js";
+import { parseActivityTops } from "./system-ops.js";
 import {
   correlatePhysicalDisplays,
   parseDevices,
@@ -131,6 +132,38 @@ export interface KeySequenceResult {
   completed?: boolean;
   stoppedAt?: number;
   checks?: Array<SequenceCheckReport | null>;
+}
+
+function assertInputNumber(value: number): string {
+  if (!Number.isFinite(value) || value < 0) {
+    throw new Error(`Invalid input coordinate: ${value}`);
+  }
+  const text = String(value);
+  if (!/^\d+(?:\.\d+)?$/.test(text)) {
+    throw new Error(`Invalid input coordinate: ${value}`);
+  }
+  return text;
+}
+
+/** One on-device shell so the pause sits between two complete taps. */
+export function buildDoubleTapScript(
+  displayTargeting: boolean,
+  displayId: number,
+  x: number,
+  y: number,
+  gapMs: number,
+): string {
+  if (!Number.isInteger(displayId) || displayId < 0) {
+    throw new Error(`Invalid display id: ${displayId}`);
+  }
+  if (!Number.isInteger(gapMs) || gapMs < 0) {
+    throw new Error(`Invalid double-tap gap: ${gapMs}`);
+  }
+  const xArg = assertInputNumber(x);
+  const yArg = assertInputNumber(y);
+  const target = displayTargeting ? `-d ${displayId} ` : "";
+  const tap = `input touchscreen ${target}tap ${xArg} ${yArg}`;
+  return `${tap} && sleep ${(gapMs / 1000).toFixed(3)} && ${tap}`;
 }
 
 export class AndroidController {
@@ -532,7 +565,7 @@ export class AndroidController {
     await this.requireDisplay(serial, displayId, signal);
     if (displayId !== 0) {
       throw new Error(
-        "Portable uiautomator cannot select a non-default display; enable the instrumentation backend",
+        "Portable uiautomator cannot select a non-default display. Start the companion and read the UI again.",
       );
     }
     const remotePath = `/data/local/tmp/polyscreen-${randomUUID()}.xml`;
@@ -584,6 +617,120 @@ export class AndroidController {
       [],
       [{ x, y }],
     );
+  }
+
+  async doubleTap(
+    serial: string,
+    displayId: number,
+    x: number,
+    y: number,
+    gapMs: number,
+    signal?: AbortSignal,
+  ): Promise<OperationEnvelope<{ x: number; y: number; gapMs: number }>> {
+    const prepared = await this.prepareInput(
+      serial,
+      displayId,
+      ["touchscreen", "-d", String(displayId), "tap", String(x), String(y)],
+      signal,
+      [],
+      [{ x, y }],
+    );
+    const script = buildDoubleTapScript(
+      prepared.inputArgs.includes("-d"),
+      displayId,
+      x,
+      y,
+      gapMs,
+    );
+    const result = await this.#queue.mutate(serial, () =>
+      this.adb.run(["shell", "sh", "-c", quoteRemoteShellArg(script)], {
+        serial,
+        signal,
+        timeoutMs: 15_000,
+      }),
+    );
+    return this.envelope(
+      serial,
+      displayId,
+      "adb",
+      { x, y, gapMs },
+      result.durationMs,
+      prepared.warnings,
+    );
+  }
+
+  async longPress(
+    serial: string,
+    displayId: number,
+    x: number,
+    y: number,
+    durationMs: number,
+    signal?: AbortSignal,
+  ): Promise<OperationEnvelope<{ x: number; y: number; durationMs: number }>> {
+    return await this.mutate(
+      serial,
+      displayId,
+      [
+        "touchscreen",
+        "-d",
+        String(displayId),
+        "swipe",
+        String(x),
+        String(y),
+        String(x),
+        String(y),
+        String(durationMs),
+      ],
+      { x, y, durationMs },
+      signal,
+      [],
+      [{ x, y }],
+    );
+  }
+
+  async foregroundApp(
+    serial: string,
+    displayId: number,
+    signal?: AbortSignal,
+  ): Promise<{
+    serial: string;
+    displayId: number;
+    source: "window-focus" | "activity-top" | "none";
+    packageName?: string;
+    activity?: string;
+    taskId?: number;
+    focusedWindow?: string;
+  }> {
+    await this.requireDevice(serial, signal);
+    const focused = (await this.sampleFocus(serial, [displayId], signal))[
+      String(displayId)
+    ];
+    if (focused?.packageName || focused?.activity) {
+      return { serial, displayId, source: "window-focus", ...focused };
+    }
+    const raw = await this.adb.text(
+      ["shell", "dumpsys", "activity", "activities"],
+      {
+        serial,
+        signal,
+        timeoutMs: 15_000,
+        maxOutputBytes: 4 * 1024 * 1024,
+      },
+    );
+    const top = parseActivityTops(raw).find(
+      (entry) =>
+        entry.packageName &&
+        (entry.displayId === undefined || entry.displayId === displayId),
+    );
+    if (!top?.packageName) return { serial, displayId, source: "none" };
+    return {
+      serial,
+      displayId,
+      source: "activity-top",
+      packageName: top.packageName,
+      ...(top.activity ? { activity: top.activity } : {}),
+      ...(top.taskId !== undefined ? { taskId: top.taskId } : {}),
+    };
   }
 
   async swipe(
@@ -945,6 +1092,60 @@ export class AndroidController {
       }
       await abortableDelay(Math.min(pollMs, timeoutMs - elapsed), signal);
     }
+  }
+
+  async tapAndType(
+    serial: string,
+    displayId: number,
+    x: number,
+    y: number,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<OperationEnvelope<{ text: string; unicodeReliable: false }>> {
+    const encoded = text.replaceAll(" ", "%s");
+    const tapPrepared = await this.prepareInput(
+      serial,
+      displayId,
+      ["touchscreen", "-d", String(displayId), "tap", String(x), String(y)],
+      signal,
+      [],
+      [{ x, y }],
+    );
+    const textPrepared = await this.prepareInput(
+      serial,
+      displayId,
+      [
+        "keyboard",
+        "-d",
+        String(displayId),
+        "text",
+        quoteRemoteShellArg(encoded),
+      ],
+      signal,
+      [
+        "ADB input text is not reliable for arbitrary Unicode; use the scrcpy backend when enabled",
+      ],
+      [],
+    );
+    const started = performance.now();
+    await this.#queue.mutate(serial, async () => {
+      await this.adb.run(["shell", "input", ...tapPrepared.inputArgs], {
+        serial,
+        signal,
+      });
+      await this.adb.run(["shell", "input", ...textPrepared.inputArgs], {
+        serial,
+        signal,
+      });
+    });
+    return this.envelope(
+      serial,
+      displayId,
+      "adb",
+      { text, unicodeReliable: false },
+      Math.round(performance.now() - started),
+      [...new Set([...tapPrepared.warnings, ...textPrepared.warnings])],
+    );
   }
 
   async inputText(

@@ -98,6 +98,87 @@ function decodeXml(value: string): string {
     .replaceAll("&amp;", "&");
 }
 
+function companionText(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function companionFlag(value: unknown): boolean {
+  return value === true;
+}
+
+function companionNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/** Map a companion `hierarchy` response into the same nodes a UI dump produces. */
+export function uiNodesFromCompanion(raw: Record<string, unknown>): UiNode[] {
+  if (!Array.isArray(raw.nodes)) {
+    throw new Error("Companion hierarchy did not include nodes");
+  }
+  const drawingOrders: number[] = [];
+  const nodes = raw.nodes.map((item, nodeIndex) => {
+    if (!item || typeof item !== "object") {
+      throw new Error("Companion hierarchy node is not an object");
+    }
+    const record = item as Record<string, unknown>;
+    const boundsRaw = record.bounds;
+    const bounds =
+      boundsRaw && typeof boundsRaw === "object"
+        ? {
+            left: companionNumber(
+              (boundsRaw as Record<string, unknown>).left,
+              0,
+            ),
+            top: companionNumber((boundsRaw as Record<string, unknown>).top, 0),
+            right: companionNumber(
+              (boundsRaw as Record<string, unknown>).right,
+              0,
+            ),
+            bottom: companionNumber(
+              (boundsRaw as Record<string, unknown>).bottom,
+              0,
+            ),
+          }
+        : undefined;
+    const parentIndex = companionNumber(record.parentIndex, -1);
+    drawingOrders.push(
+      parentIndex === -1 ? 0 : companionNumber(record.drawingOrder, 0),
+    );
+    return {
+      nodeIndex,
+      parentIndex,
+      paintIndex: nodeIndex,
+      depth: companionNumber(record.depth, 0),
+      text: companionText(record.text),
+      contentDescription: companionText(record.contentDescription),
+      resourceId: companionText(record.viewId),
+      className: companionText(record.className),
+      packageName: companionText(record.packageName),
+      clickable: companionFlag(record.clickable),
+      longClickable: companionFlag(record.longClickable),
+      enabled: companionFlag(record.enabled),
+      focusable: companionFlag(record.focusable),
+      focused: companionFlag(record.focused),
+      scrollable: companionFlag(record.scrollable),
+      checkable: companionFlag(record.checkable),
+      checked: companionFlag(record.checked),
+      selected: companionFlag(record.selected),
+      password: companionFlag(record.password),
+      ...(bounds
+        ? {
+            bounds,
+            center: {
+              x: (bounds.left + bounds.right) / 2,
+              y: (bounds.top + bounds.bottom) / 2,
+            },
+          }
+        : {}),
+    };
+  });
+  assignPaintOrder(nodes, drawingOrders);
+  return nodes;
+}
+
 export function parseUiNodes(xml: string): UiNode[] {
   const nodes: UiNode[] = [];
   const open: number[] = [];
@@ -382,6 +463,7 @@ export function serializeUiMatches(
     const flags = FLAGS.filter((flag) => match[flag]);
     return {
       nodeIndex: match.nodeIndex,
+      ref: `@n${match.nodeIndex}`,
       parentIndex: match.parentIndex,
       className: match.className,
       ...(match.text ? { text: match.text } : {}),
@@ -398,6 +480,79 @@ export function serializeUiMatches(
       ...(match.warnings.length > 0 ? { warnings: match.warnings } : {}),
     };
   });
+}
+
+export interface ResolvedUiRef {
+  ref: string;
+  nodeIndex: number;
+  x: number;
+  y: number;
+}
+
+/**
+ * Refs from the latest UI read for one serial and logical display.
+ * The next snapshot, find, or wait replaces them.
+ */
+export class UiRefCache {
+  readonly #displays = new Map<string, Map<string, ResolvedUiRef | string>>();
+
+  replace(
+    serial: string,
+    displayId: number,
+    nodes: readonly Record<string, unknown>[],
+  ): void {
+    const refs = new Map<string, ResolvedUiRef | string>();
+    for (const node of nodes) {
+      if (typeof node.ref !== "string" || typeof node.nodeIndex !== "number") {
+        continue;
+      }
+      const tap = node.tap;
+      if (
+        !isRecord(tap) ||
+        typeof tap.x !== "number" ||
+        typeof tap.y !== "number"
+      ) {
+        const warnings = Array.isArray(node.warnings)
+          ? node.warnings.filter((warning) => typeof warning === "string")
+          : [];
+        refs.set(
+          node.ref,
+          warnings.length > 0
+            ? `${node.ref} has no tap point. ${warnings.join(" ")}`
+            : `${node.ref} has no tap point`,
+        );
+        continue;
+      }
+      refs.set(node.ref, {
+        ref: node.ref,
+        nodeIndex: node.nodeIndex,
+        x: tap.x,
+        y: tap.y,
+      });
+    }
+    this.#displays.set(`${serial}\0${displayId}`, refs);
+  }
+
+  resolve(serial: string, displayId: number, ref: string): ResolvedUiRef {
+    const refs = this.#displays.get(`${serial}\0${displayId}`);
+    if (!refs) {
+      throw new Error(
+        `No UI refs for ${serial} display ${displayId}. Call mobile_ui_snapshot or mobile_ui_find first.`,
+      );
+    }
+    const hit = refs.get(ref);
+    if (hit === undefined) {
+      throw new Error(
+        `Unknown ref ${ref} for ${serial} display ${displayId}. Read the UI again; refs last only until the next snapshot, find, or wait.`,
+      );
+    }
+    if (typeof hit === "string") throw new Error(hit);
+    return hit;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 /** Attaches a tap plan to each node in `subset`, hit-testing against `nodes`. */

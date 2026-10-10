@@ -100,16 +100,16 @@ Stdio remains the default. The server speaks MCP `2026-07-28` (stateless Streama
 
 The default `core` profile is deliberately compact. Additional profiles advertise tools only when requested.
 
-| Profile        | Capabilities                                                                                                                 |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `core`         | Server info, devices, displays, screenshots, async record/analyze, async focus traces, artifacts list/prune, UI, input, apps |
-| `apps`         | Packages, default-app roles, notifications (list/get/post), and scoped broadcasts                                            |
-| `diagnostics`  | Dumpsys slices, logcat snapshot/start/stop, wake, night mode, debuggable shared_prefs read                                   |
-| `files`        | Constrained push/pull under approved roots                                                                                   |
-| `performance`  | CPU, power, battery, memory, and frame snapshots                                                                             |
-| `device-admin` | Explicit runtime permission grant/revoke                                                                                     |
-| `companion`    | All-display accessibility windows and explicit key press/down/up                                                             |
-| `all`          | Every implemented profile                                                                                                    |
+| Profile        | Capabilities                                                                                                                           |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `core`         | Server info, devices, displays, screenshots, async record/analyze, async focus traces, artifacts list/prune, UI, input, apps           |
+| `apps`         | Packages, default-app roles, notifications (list/get/post), and scoped broadcasts                                                      |
+| `diagnostics`  | Dumpsys slices, activity tops, layer hints, crash list/get, logcat snapshot/start/stop, wake, night mode, debuggable shared_prefs read |
+| `files`        | Constrained push/pull under approved roots                                                                                             |
+| `performance`  | CPU, power, battery, memory, and frame snapshots                                                                                       |
+| `device-admin` | Explicit runtime permission grant/revoke                                                                                               |
+| `companion`    | All-display accessibility windows and explicit key press/down/up                                                                       |
+| `all`          | Every implemented profile                                                                                                              |
 
 `unsafe` and emulator profiles are reserved but do not expose raw shell in this release.
 
@@ -118,7 +118,7 @@ The default `core` profile is deliberately compact. Additional profiles advertis
 Stdio launch (pin the published version):
 
 ```text
-npx -y polyscreen-mcp@0.8.0 --profile core diagnostics
+npx -y polyscreen-mcp@0.9.0 --profile core diagnostics
 ```
 
 `diagnostics` is required for logcat start/stop, activity tops, wake, and night-mode tools. After editing config or reconnecting, call `mobile_server_info` once and confirm `version`, `toolCount`, and detective tools match a fresh `tools/list`. Prefer an MCP host that speaks `2026-07-28` so the client negotiates the modern era instead of falling back to 2025 `initialize`.
@@ -144,7 +144,7 @@ Same `mcpServers` shape (merge into the existing object):
   "mcpServers": {
     "polyscreen": {
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.9.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -162,7 +162,7 @@ Workspace `.vscode/mcp.json` — note the `servers` root key (not `mcpServers`):
     "polyscreen": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.9.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -174,7 +174,7 @@ Preferred: workspace `.continue/mcpServers/polyscreen.yaml` (Continue also accep
 
 ```yaml
 name: PolyScreen MCP
-version: 0.8.0
+version: 0.9.0
 schema: v1
 mcpServers:
   - name: polyscreen
@@ -182,7 +182,7 @@ mcpServers:
     command: npx
     args:
       - -y
-      - polyscreen-mcp@0.8.0
+      - polyscreen-mcp@0.9.0
       - --profile
       - core
       - diagnostics
@@ -197,7 +197,7 @@ mcpServers:
   "context_servers": {
     "polyscreen": {
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.9.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -226,13 +226,16 @@ Endpoint: `http://127.0.0.1:3300/mcp`. HTTP always binds to loopback, validates 
 - `mobile_theme_flash_report`
 - `mobile_focus_trace` (blocking) / `mobile_focus_trace_start` / `mobile_focus_trace_stop`
 - `mobile_artifacts_list` / `mobile_artifacts_prune`
-- `mobile_ui_snapshot` / `mobile_ui_find` / `mobile_ui_wait`
-- `mobile_input_tap` / `mobile_input_swipe` / `mobile_input_drag`
+- `mobile_ui_snapshot` / `mobile_ui_find` / `mobile_ui_wait` — each node includes `ref` (`@nN`)
+- `mobile_input_tap` / `mobile_input_double_tap` / `mobile_input_long_press` / `mobile_input_swipe` / `mobile_input_drag`
 - `mobile_input_key` / `mobile_input_key_sequence` / `mobile_input_key_combination` / `mobile_input_text`. `mobile_input_key_sequence` sends a timed sequence: digits between actions are millisecond pauses, not a simultaneous chord, and `x,y` tokens are taps (`x,y+x,y` is a touch combo with no pause between points). `stepped.checks` runs that walk one action at a time and polls for a UI node before the next action.
-- `mobile_app_inspect` / `mobile_app_launch` / `mobile_app_stop` / `mobile_app_relaunch_on_displays`
+- `mobile_batch` — run up to 16 registered tools in one call (screenshots and blocking records stay outside the batch)
+- `mobile_app_inspect` / `mobile_app_launch` / `mobile_app_stop` / `mobile_app_relaunch_on_displays` / `mobile_app_foreground`
 - `mobile_app_install` / `mobile_app_uninstall`
+- `mobile_open_url` (http and https only)
+- `mobile_orientation` / `mobile_device_fold` / `mobile_location` / `mobile_clipboard`
 
-Every display-sensitive tool takes a framework **logical** `displayId`. Screenshot and recording implementations resolve that to a SurfaceFlinger **physical** ID internally.
+Every display-sensitive tool takes a framework **logical** `displayId`. Screenshot and recording implementations resolve that to a SurfaceFlinger **physical** ID internally. `mobile_screen_capture` also returns `coordinateSpace`: multiply a screenshot pixel by `scaleX` and `scaleY` to get the logical point `mobile_input_tap` expects. Returned screenshots are downscaled when the long edge exceeds 1280px, and `coordinateSpace` describes the bytes that were returned. UI refs (`@nN`) stay valid across Streamable HTTP requests until the next UI read on that serial and display. `mobile_input_swipe`, `mobile_input_drag`, and `mobile_input_text` accept those refs. A non-default display UI dump uses the companion hierarchy when a companion session is active.
 
 Screenshots can be retained with `saveArtifact`. Artifact **listings** are metadata stubs only (`uri`, `name`, `mimeType`, `sizeBytes`). Binary bytes are read on demand via `resources/read` — prefer `mobile_analyze_recording` JSON over many `mobile_screen_capture` images when hunting flashes.
 
@@ -325,6 +328,7 @@ Stop results include `changes` / `changeCount` (focus transitions per display) �
 ### Diagnostics extras (diagnostics profile)
 
 - `mobile_logcat` / `mobile_logcat_start` / `mobile_logcat_stop`
+- `mobile_crashes_list` / `mobile_crash_get` (dropbox crash, ANR, and tombstone tags)
 - `mobile_diagnostics_collect` / `mobile_diagnostics_activity_tops` / `mobile_diagnostics_layer_hints`
 - `mobile_power_wake` / `mobile_uimode_get` / `mobile_uimode_set`
 - `mobile_app_prefs_read` (debuggable `run-as` shared_prefs)
@@ -409,13 +413,14 @@ Android delivers a touch to the **last-painted clickable view** under the point,
 
 Every node from `mobile_ui_snapshot`, `mobile_ui_find`, and `mobile_ui_wait` therefore carries a resolved tap plan alongside its raw geometry:
 
-| Field        | Meaning                                                                                                   |
-| ------------ | --------------------------------------------------------------------------------------------------------- |
-| `center`     | Raw geometric centre of `bounds`. Reported as-is; it may belong to another view.                          |
-| `tap`        | `{ x, y, nodeIndex, via, adjusted }` — the point that reaches this node. Pass this to `mobile_input_tap`. |
-| `tappable`   | `false` when the node is off-screen or completely covered.                                                |
-| `occludedBy` | The clickable node that would swallow a tap on `center`.                                                  |
-| `warnings`   | Why the plan differs from `center`, or why there is no plan.                                              |
+| Field        | Meaning                                                                                                                                                                 |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `center`     | Raw geometric centre of `bounds`. Reported as-is; it may belong to another view.                                                                                        |
+| `ref`        | `@n` plus `nodeIndex`. Pass it to `mobile_input_tap`, `mobile_input_double_tap`, or `mobile_input_long_press`. Valid until the next UI read on that serial and display. |
+| `tap`        | `{ x, y, nodeIndex, via, adjusted }` — the point that reaches this node. Pass this, or `ref`, to `mobile_input_tap`.                                                    |
+| `tappable`   | `false` when the node is off-screen or completely covered.                                                                                                              |
+| `occludedBy` | The clickable node that would swallow a tap on `center`.                                                                                                                |
+| `warnings`   | Why the plan differs from `center`, or why there is no plan.                                                                                                            |
 
 Inside `tap`, `nodeIndex` and `via` name the view that receives the click — `self`, an `ancestor` container, or `unhandled` when nothing in the branch is exposed as clickable and the tap depends on an undeclared touch handler. `adjusted` is `true` when the point had to move off that view's own centre to dodge something painted over it. When a node is not tappable, scroll it clear or dismiss the overlay named in `occludedBy` instead of tapping blind.
 

@@ -272,6 +272,39 @@ export class CompanionManager {
     );
   }
 
+  isActive(serial: string): boolean {
+    return this.#sessions.has(serial);
+  }
+
+  async clipboard(
+    serial: string,
+    action: "get" | "set",
+    text?: string,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    return await this.session(serial).connection.request(
+      {
+        op: "clipboard",
+        action,
+        ...(text === undefined ? {} : { text }),
+      },
+      10_000,
+      signal,
+    );
+  }
+
+  async hierarchy(
+    serial: string,
+    displayId: number,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
+    return await this.session(serial).connection.request(
+      { op: "hierarchy", displayId },
+      10_000,
+      signal,
+    );
+  }
+
   async releaseAll(serial: string, signal?: AbortSignal): Promise<void> {
     await this.session(serial).connection.request(
       { op: "releaseAll" },

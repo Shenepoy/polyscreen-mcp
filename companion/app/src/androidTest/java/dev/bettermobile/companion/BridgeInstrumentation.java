@@ -4,6 +4,10 @@ import android.app.Activity;
 import android.app.Instrumentation;
 import android.app.UiAutomation;
 import android.accessibilityservice.AccessibilityServiceInfo;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
+import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.SparseArray;
@@ -25,6 +29,8 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -130,6 +136,10 @@ public final class BridgeInstrumentation extends Instrumentation {
                     return ok(id);
                 case "windows":
                     return windows(id);
+                case "clipboard":
+                    return clipboard(id, request);
+                case "hierarchy":
+                    return hierarchy(id, request);
                 case "shutdown":
                     running = false;
                     releaseAll();
@@ -264,6 +274,148 @@ public final class BridgeInstrumentation extends Instrumentation {
         return put(ok(id), "displays", displays);
     }
 
+    private JSONObject clipboard(long id, JSONObject request) {
+        ClipboardManager manager =
+                (ClipboardManager) getContext().getSystemService(Context.CLIPBOARD_SERVICE);
+        if (manager == null) {
+            JSONObject denied = put(ok(id), "readable", false);
+            put(denied, "reason", "ClipboardManager is not available");
+            return denied;
+        }
+        String action = request.optString("action", "get");
+        if ("set".equals(action)) {
+            String text = request.optString("text", "");
+            if (text.length() > 8000) {
+                throw new IllegalArgumentException("Clipboard text exceeds 8000 characters");
+            }
+            manager.setPrimaryClip(ClipData.newPlainText("polyscreen", text));
+            return put(ok(id), "set", true);
+        }
+        if (!"get".equals(action)) {
+            throw new IllegalArgumentException("Unknown clipboard action: " + action);
+        }
+        try {
+            if (!manager.hasPrimaryClip()) {
+                JSONObject hidden = put(ok(id), "readable", false);
+                put(
+                        hidden,
+                        "reason",
+                        "No clip was visible to the companion. It may be empty, or Android hid it from this process.");
+                return hidden;
+            }
+            ClipData clip = manager.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) {
+                JSONObject denied = put(ok(id), "readable", false);
+                put(denied, "reason", "Clipboard read returned no clip");
+                return denied;
+            }
+            CharSequence value = clip.getItemAt(0).getText();
+            if (value == null) {
+                JSONObject denied = put(ok(id), "readable", false);
+                put(denied, "reason", "The primary clip has no plain text");
+                return denied;
+            }
+            JSONObject result = put(ok(id), "readable", true);
+            put(result, "text", value.toString());
+            return result;
+        } catch (SecurityException error) {
+            JSONObject denied = put(ok(id), "readable", false);
+            put(denied, "reason", "Clipboard read was denied: " + error.getMessage());
+            return denied;
+        }
+    }
+
+    private JSONObject hierarchy(long id, JSONObject request) {
+        int displayId = request.optInt("displayId", 0);
+        JSONArray nodes = new JSONArray();
+        int[] count = new int[] {0};
+        boolean[] truncated = new boolean[] {false};
+        SparseArray<List<AccessibilityWindowInfo>> all = automation.getWindowsOnAllDisplays();
+        List<AccessibilityWindowInfo> selectedWindows = new ArrayList<>();
+        for (int index = 0; index < all.size(); index++) {
+            List<AccessibilityWindowInfo> windows = all.valueAt(index);
+            if (all.keyAt(index) != displayId) {
+                for (AccessibilityWindowInfo window : windows) window.recycle();
+                continue;
+            }
+            selectedWindows.addAll(windows);
+        }
+        // The platform lists the top window first. Walk the bottom window first
+        // so a later paint index is the one that receives the touch.
+        Collections.reverse(selectedWindows);
+        for (AccessibilityWindowInfo window : selectedWindows) {
+            AccessibilityNodeInfo root = window.getRoot();
+            try {
+                if (root != null) walk(nodes, root, -1, 0, count, truncated);
+            } finally {
+                window.recycle();
+            }
+        }
+        JSONObject result = put(ok(id), "nodes", nodes);
+        put(result, "truncated", truncated[0]);
+        return result;
+    }
+
+    private void walk(
+            JSONArray nodes,
+            AccessibilityNodeInfo node,
+            int parentIndex,
+            int depth,
+            int[] count,
+            boolean[] truncated) {
+        if (count[0] >= 500) {
+            truncated[0] = true;
+            node.recycle();
+            return;
+        }
+        int index = count[0]++;
+        Rect bounds = new Rect();
+        node.getBoundsInScreen(bounds);
+        JSONObject item = new JSONObject();
+        put(item, "parentIndex", parentIndex);
+        put(item, "depth", depth);
+        put(item, "className", textOf(node.getClassName()));
+        put(item, "text", textOf(node.getText()));
+        put(item, "contentDescription", textOf(node.getContentDescription()));
+        put(item, "viewId", textOf(node.getViewIdResourceName()));
+        put(item, "packageName", textOf(node.getPackageName()));
+        put(item, "clickable", node.isClickable());
+        put(item, "longClickable", node.isLongClickable());
+        put(item, "enabled", node.isEnabled());
+        put(item, "focusable", node.isFocusable());
+        put(item, "focused", node.isFocused());
+        put(item, "scrollable", node.isScrollable());
+        put(item, "checkable", node.isCheckable());
+        put(item, "checked", node.isChecked());
+        put(item, "selected", node.isSelected());
+        put(item, "password", node.isPassword());
+        put(item, "drawingOrder", node.getDrawingOrder());
+        put(
+                item,
+                "bounds",
+                object(
+                        "left", bounds.left,
+                        "top", bounds.top,
+                        "right", bounds.right,
+                        "bottom", bounds.bottom));
+        nodes.put(item);
+        int children = node.getChildCount();
+        for (int childIndex = 0; childIndex < children; childIndex++) {
+            if (count[0] >= 500) {
+                truncated[0] = true;
+                break;
+            }
+            AccessibilityNodeInfo child = node.getChild(childIndex);
+            if (child == null) continue;
+            walk(nodes, child, index, depth + 1, count, truncated);
+        }
+        node.recycle();
+    }
+
+    private static String textOf(CharSequence value) {
+        return value == null ? "" : value.toString();
+    }
+
     private JSONObject hello(long id) {
         JSONObject capabilities =
                 object(
@@ -271,6 +423,8 @@ public final class BridgeInstrumentation extends Instrumentation {
                         "keyRepeats", true,
                         "keyDisplayTarget", false,
                         "windowsOnAllDisplays", true,
+                        "clipboard", true,
+                        "hierarchy", true,
                         "joystickAxes", false,
                         "physicalDeviceIdentity", false);
         return object(

@@ -3,6 +3,11 @@ import { z } from "zod";
 
 import { AdbProfiles } from "../android/adb-profiles.js";
 import { AndroidController } from "../android/android-controller.js";
+import { DeviceActions } from "../android/device-actions.js";
+import {
+  downscaleScreenshot,
+  screenshotCoordinateSpace,
+} from "../android/png.js";
 import {
   DEFAULT_FOCUS_INTERVAL_MS,
   DEFAULT_FOCUS_MAX_SAMPLES,
@@ -20,8 +25,11 @@ import {
   findUiNodes,
   parseUiNodes,
   serializeUiMatches,
+  UiRefCache,
+  uiNodesFromCompanion,
   withTapPlans,
 } from "../android/ui.js";
+import type { AndroidDisplay } from "../android/types.js";
 import { ArtifactStore } from "../artifacts/store.js";
 import { CompanionManager } from "../backends/companion.js";
 import { abortableDelay } from "../utils/abortable-delay.js";
@@ -128,6 +136,91 @@ const readAnnotations = {
   openWorldHint: false,
 };
 
+const BATCH_EXCLUDED = new Set([
+  "mobile_batch",
+  "mobile_screen_capture",
+  "mobile_screen_capture_pair",
+  "mobile_screen_record",
+]);
+
+const gesturePointSchema = {
+  serial: serialSchema,
+  displayId: displayIdSchema,
+  ref: z
+    .string()
+    .regex(/^@n\d+$/)
+    .optional()
+    .describe(
+      "Ref from the latest mobile_ui_snapshot, mobile_ui_find, or mobile_ui_wait on this serial and display. Wins over x and y.",
+    ),
+  x: z.number().finite().nonnegative().optional(),
+  y: z.number().finite().nonnegative().optional(),
+};
+
+const coordinateSpaceSchema = z.object({
+  imageWidth: z.number(),
+  imageHeight: z.number(),
+  displayWidth: z.number().optional(),
+  displayHeight: z.number().optional(),
+  scaleX: z.number().optional(),
+  scaleY: z.number().optional(),
+});
+
+const refSchema = z
+  .string()
+  .regex(/^@n\d+$/)
+  .describe(
+    "Ref from the latest mobile_ui_snapshot, mobile_ui_find, or mobile_ui_wait on this serial and display.",
+  );
+
+async function presentedScreenshot(
+  png: Buffer,
+  display: AndroidDisplay,
+  signal?: AbortSignal,
+): Promise<{
+  png: Buffer;
+  downscaled: boolean;
+  coordinateSpace: ReturnType<typeof screenshotCoordinateSpace>;
+}> {
+  const scaled = await downscaleScreenshot(png, signal);
+  return {
+    png: scaled.png,
+    downscaled: scaled.downscaled,
+    coordinateSpace: screenshotCoordinateSpace(scaled.png, display),
+  };
+}
+
+type ToolHandler = (
+  args: Record<string, unknown>,
+  ctx: { mcpReq: { signal: AbortSignal } },
+) => Promise<{ structuredContent?: unknown }>;
+
+function resolveGesturePoint(
+  uiRefs: UiRefCache,
+  serial: string,
+  displayId: number,
+  ref: string | undefined,
+  x: number | undefined,
+  y: number | undefined,
+): { x: number; y: number; ref?: string } {
+  if (ref) {
+    const hit = uiRefs.resolve(serial, displayId, ref);
+    return { ref, x: hit.x, y: hit.y };
+  }
+  if (x === undefined || y === undefined) {
+    throw new Error("Pass ref from a UI read, or both x and y");
+  }
+  return { x, y };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function clipboardNeedsCompanion(error: unknown): boolean {
+  return /clipboard|no shell command/i.test(errorMessage(error));
+}
+
 export function createPolyScreenRuntime(
   options: PolyScreenServerOptions = {},
 ): PolyScreenRuntime {
@@ -145,11 +238,42 @@ export function createPolyScreenRuntime(
     options.focusTraces ?? new FocusTraceSessionManager(controller);
   const systemOps = options.systemOps ?? new SystemOps(controller.adb);
   const profiles = options.profiles ?? new Set(["core"]);
+  const uiRefs = new UiRefCache();
+  const deviceActions = new DeviceActions(controller.adb);
   let cachedToolNames: string[] | undefined;
   let loggedRegistration = false;
 
   const createServer = (): PolyScreenMcpServer => {
     const registeredToolNames: string[] = [];
+    const toolHandlers = new Map<
+      string,
+      { schema: z.ZodType; handler: ToolHandler }
+    >();
+    const readUiHierarchy = async (
+      serial: string,
+      displayId: number,
+      signal: AbortSignal,
+    ): Promise<{
+      nodes: ReturnType<typeof parseUiNodes>;
+      backend: string;
+      truncated: boolean;
+    }> => {
+      if (displayId !== 0 && companion.isActive(serial)) {
+        const raw = await companion.hierarchy(serial, displayId, signal);
+        return {
+          nodes: uiNodesFromCompanion(raw),
+          backend: "companion-accessibility",
+          truncated: raw.truncated === true,
+        };
+      }
+      const xml = await controller.uiSnapshot(serial, displayId, signal);
+      const nodes = parseUiNodes(xml);
+      return {
+        nodes,
+        backend: "adb-uiautomator",
+        truncated: nodes.length > 500,
+      };
+    };
     const server = new McpServer({
       name: PACKAGE_NAME,
       version: PACKAGE_VERSION,
@@ -157,6 +281,14 @@ export function createPolyScreenRuntime(
     const registerTool = server.registerTool.bind(server);
     server.registerTool = ((name: string, ...rest: unknown[]) => {
       registeredToolNames.push(name);
+      const config = rest[0] as { inputSchema?: z.ZodType } | undefined;
+      const handler = rest[1];
+      if (config?.inputSchema && typeof handler === "function") {
+        toolHandlers.set(name, {
+          schema: config.inputSchema,
+          handler: handler as ToolHandler,
+        });
+      }
       return (registerTool as (...args: unknown[]) => unknown)(name, ...rest);
     }) as typeof server.registerTool;
 
@@ -323,7 +455,7 @@ export function createPolyScreenRuntime(
       {
         title: "Capture an Android display",
         description:
-          "Capture one logical display after resolving its SurfaceFlinger physical display ID.",
+          "Capture one logical display after resolving its SurfaceFlinger physical display ID. Images whose long edge exceeds 1280px are downscaled before they are returned. coordinateSpace.scaleX and scaleY convert those screenshot pixels into the logical coordinates used by mobile_input_tap.",
         inputSchema: z.object({
           serial: serialSchema,
           displayId: displayIdSchema,
@@ -335,6 +467,8 @@ export function createPolyScreenRuntime(
           mimeType: z.literal("image/png"),
           sizeBytes: z.number(),
           durationMs: z.number(),
+          downscaled: z.boolean(),
+          coordinateSpace: coordinateSpaceSchema,
           artifactUri: z.string().optional(),
         }),
         annotations: mutationAnnotations,
@@ -345,22 +479,29 @@ export function createPolyScreenRuntime(
           displayId,
           ctx.mcpReq.signal,
         );
+        const presented = await presentedScreenshot(
+          capture.png,
+          capture.display,
+          ctx.mcpReq.signal,
+        );
         const artifact = saveArtifact
-          ? await artifacts.save(capture.png, ".png", `display-${displayId}`)
+          ? await artifacts.save(presented.png, ".png", `display-${displayId}`)
           : undefined;
         const metadata = {
           serial,
           display: capture.display,
           mimeType: "image/png" as const,
-          sizeBytes: capture.png.length,
+          sizeBytes: presented.png.length,
           durationMs: capture.durationMs,
+          downscaled: presented.downscaled,
+          coordinateSpace: presented.coordinateSpace,
           ...(artifact ? { artifactUri: artifact.uri } : {}),
         };
         return {
           content: [
             {
               type: "image",
-              data: capture.png.toString("base64"),
+              data: presented.png.toString("base64"),
               mimeType: "image/png",
             },
             ...jsonContent(metadata),
@@ -998,6 +1139,8 @@ export function createPolyScreenRuntime(
               mimeType: z.literal("image/png"),
               sizeBytes: z.number(),
               durationMs: z.number(),
+              downscaled: z.boolean(),
+              coordinateSpace: coordinateSpaceSchema,
               artifactUri: z.string().optional(),
             }),
           ),
@@ -1016,9 +1159,14 @@ export function createPolyScreenRuntime(
           | { type: "text"; text: string }
         > = [];
         for (const capture of pair.captures) {
+          const presented = await presentedScreenshot(
+            capture.png,
+            capture.display,
+            ctx.mcpReq.signal,
+          );
           const artifact = saveArtifact
             ? await artifacts.save(
-                capture.png,
+                presented.png,
                 ".png",
                 `display-${capture.displayId}`,
               )
@@ -1026,13 +1174,15 @@ export function createPolyScreenRuntime(
           captures.push({
             displayId: capture.displayId,
             mimeType: "image/png" as const,
-            sizeBytes: capture.png.length,
+            sizeBytes: presented.png.length,
             durationMs: capture.durationMs,
+            downscaled: presented.downscaled,
+            coordinateSpace: presented.coordinateSpace,
             ...(artifact ? { artifactUri: artifact.uri } : {}),
           });
           content.push({
             type: "image",
-            data: capture.png.toString("base64"),
+            data: presented.png.toString("base64"),
             mimeType: "image/png",
           });
         }
@@ -1051,7 +1201,7 @@ export function createPolyScreenRuntime(
       {
         title: "Snapshot Android UI",
         description:
-          "Return parsed accessibility nodes, each with the point that actually routes a tap to it. Portable ADB supports only display 0; other displays require the companion.",
+          "Return parsed accessibility nodes, each with a ref (@nN) and the point that actually routes a tap to it. Pass ref to tap, double-tap, long-press, swipe, drag, or text. Refs are shared across HTTP requests until the next UI read on this serial and display. Portable ADB supports only display 0; other displays use the companion hierarchy when a companion session is active.",
         inputSchema: z.object({
           serial: serialSchema,
           displayId: displayIdSchema,
@@ -1066,20 +1216,21 @@ export function createPolyScreenRuntime(
         annotations: readAnnotations,
       },
       async ({ serial, displayId }, ctx) => {
-        const xml = await controller.uiSnapshot(
+        const hierarchy = await readUiHierarchy(
           serial,
           displayId,
           ctx.mcpReq.signal,
         );
-        const allNodes = parseUiNodes(xml);
+        const nodes = serializeUiMatches(
+          withTapPlans(hierarchy.nodes, hierarchy.nodes.slice(0, 500)),
+        );
+        uiRefs.replace(serial, displayId, nodes);
         const result = {
           serial,
           displayId,
-          backend: "adb-uiautomator",
-          nodes: serializeUiMatches(
-            withTapPlans(allNodes, allNodes.slice(0, 500)),
-          ),
-          truncated: allNodes.length > 500,
+          backend: hierarchy.backend,
+          nodes,
+          truncated: hierarchy.truncated || hierarchy.nodes.length > 500,
         };
         return { content: jsonContent(result), structuredContent: result };
       },
@@ -1099,7 +1250,7 @@ export function createPolyScreenRuntime(
       {
         title: "Find Android UI nodes",
         description:
-          "Find accessibility nodes by text, content description, or resource ID. Tap using each match's tap.x/tap.y, which accounts for clickable containers and overlays; the raw center often belongs to another view.",
+          "Find accessibility nodes by text, content description, or resource ID. Each match has a ref (@nN) and a tap point that accounts for clickable containers and overlays. Pass ref to mobile_input_tap. This replaces refs from the previous UI read.",
         inputSchema: findInput,
         outputSchema: z.object({
           matches: z.array(z.record(z.string(), z.unknown())),
@@ -1108,17 +1259,19 @@ export function createPolyScreenRuntime(
         annotations: readAnnotations,
       },
       async ({ serial, displayId, ...query }, ctx) => {
-        const xml = await controller.uiSnapshot(
+        const hierarchy = await readUiHierarchy(
           serial,
           displayId,
           ctx.mcpReq.signal,
         );
-        const nodes = parseUiNodes(xml);
+        const nodes = hierarchy.nodes;
         const matches = findUiNodes(nodes, query);
+        const serialized = serializeUiMatches(
+          withTapPlans(nodes, matches.slice(0, 100)),
+        );
+        uiRefs.replace(serial, displayId, serialized);
         const result = {
-          matches: serializeUiMatches(
-            withTapPlans(nodes, matches.slice(0, 100)),
-          ),
+          matches: serialized,
           count: matches.length,
         };
         return { content: jsonContent(result), structuredContent: result };
@@ -1149,21 +1302,23 @@ export function createPolyScreenRuntime(
         let attempts = 0;
         while (performance.now() - started < timeoutMs) {
           attempts += 1;
-          const xml = await controller.uiSnapshot(
+          const hierarchy = await readUiHierarchy(
             serial,
             displayId,
             ctx.mcpReq.signal,
           );
-          const nodes = parseUiNodes(xml);
+          const nodes = hierarchy.nodes;
           const matches = findUiNodes(nodes, query);
           if (matches.length > 0) {
+            const serialized = serializeUiMatches(
+              withTapPlans(nodes, matches.slice(0, 100)),
+            );
+            uiRefs.replace(serial, displayId, serialized);
             const result = {
               found: true,
               attempts,
               elapsedMs: Math.round(performance.now() - started),
-              matches: serializeUiMatches(
-                withTapPlans(nodes, matches.slice(0, 100)),
-              ),
+              matches: serialized,
             };
             return { content: jsonContent(result), structuredContent: result };
           }
@@ -1184,21 +1339,72 @@ export function createPolyScreenRuntime(
       {
         title: "Tap Android display",
         description:
-          "Inject a display-targeted touchscreen tap in logical display coordinates. Prefer the tap point reported by mobile_ui_find over a node's raw center.",
+          "Inject a display-targeted touchscreen tap in logical display coordinates. Pass ref from the latest UI read, or x and y. ref wins when both are set. Prefer ref over a node's raw center.",
+        inputSchema: z.object(gesturePointSchema),
+        outputSchema: envelopeOutputSchema,
+        annotations: mutationAnnotations,
+      },
+      async ({ serial, displayId, ref, x, y }, ctx) => {
+        const point = resolveGesturePoint(uiRefs, serial, displayId, ref, x, y);
+        const result = await controller.tap(
+          serial,
+          displayId,
+          point.x,
+          point.y,
+          ctx.mcpReq.signal,
+        );
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
+      "mobile_input_double_tap",
+      {
+        title: "Double-tap Android display",
+        description:
+          "Inject two display-targeted taps at the same point in one on-device script, so gapMs is the pause between the taps. Pass ref or x and y.",
         inputSchema: z.object({
-          serial: serialSchema,
-          displayId: displayIdSchema,
-          ...pointSchema.shape,
+          ...gesturePointSchema,
+          gapMs: z.number().int().min(20).max(500).default(100),
         }),
         outputSchema: envelopeOutputSchema,
         annotations: mutationAnnotations,
       },
-      async ({ serial, displayId, x, y }, ctx) => {
-        const result = await controller.tap(
+      async ({ serial, displayId, ref, x, y, gapMs }, ctx) => {
+        const point = resolveGesturePoint(uiRefs, serial, displayId, ref, x, y);
+        const result = await controller.doubleTap(
           serial,
           displayId,
-          x,
-          y,
+          point.x,
+          point.y,
+          gapMs,
+          ctx.mcpReq.signal,
+        );
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
+      "mobile_input_long_press",
+      {
+        title: "Long-press Android display",
+        description:
+          "Hold a display-targeted touch at one point by swiping from that point to itself. Pass ref or x and y.",
+        inputSchema: z.object({
+          ...gesturePointSchema,
+          durationMs: z.number().int().min(200).max(10_000).default(800),
+        }),
+        outputSchema: envelopeOutputSchema,
+        annotations: mutationAnnotations,
+      },
+      async ({ serial, displayId, ref, x, y, durationMs }, ctx) => {
+        const point = resolveGesturePoint(uiRefs, serial, displayId, ref, x, y);
+        const result = await controller.longPress(
+          serial,
+          displayId,
+          point.x,
+          point.y,
+          durationMs,
           ctx.mcpReq.signal,
         );
         return { content: jsonContent(result), structuredContent: result };
@@ -1210,23 +1416,44 @@ export function createPolyScreenRuntime(
       {
         title: "Swipe Android display",
         description:
-          "Inject a display-targeted touchscreen swipe with explicit duration.",
+          "Inject a display-targeted touchscreen swipe with explicit duration. startRef and endRef come from the latest UI read and win over start and end.",
         inputSchema: z.object({
           serial: serialSchema,
           displayId: displayIdSchema,
-          start: pointSchema,
-          end: pointSchema,
+          startRef: refSchema.optional(),
+          endRef: refSchema.optional(),
+          start: pointSchema.optional(),
+          end: pointSchema.optional(),
           durationMs: z.number().int().min(1).max(60_000).default(300),
         }),
         outputSchema: envelopeOutputSchema,
         annotations: mutationAnnotations,
       },
-      async ({ serial, displayId, start, end, durationMs }, ctx) => {
+      async (
+        { serial, displayId, startRef, endRef, start, end, durationMs },
+        ctx,
+      ) => {
+        const from = resolveGesturePoint(
+          uiRefs,
+          serial,
+          displayId,
+          startRef,
+          start?.x,
+          start?.y,
+        );
+        const to = resolveGesturePoint(
+          uiRefs,
+          serial,
+          displayId,
+          endRef,
+          end?.x,
+          end?.y,
+        );
         const result = await controller.swipe(
           serial,
           displayId,
-          start,
-          end,
+          { x: from.x, y: from.y },
+          { x: to.x, y: to.y },
           durationMs,
           ctx.mcpReq.signal,
         );
@@ -1239,23 +1466,44 @@ export function createPolyScreenRuntime(
       {
         title: "Drag on Android display",
         description:
-          "Inject a capability-gated long-press drag-and-drop on one logical display.",
+          "Inject a capability-gated long-press drag-and-drop on one logical display. startRef and endRef come from the latest UI read and win over start and end.",
         inputSchema: z.object({
           serial: serialSchema,
           displayId: displayIdSchema,
-          start: pointSchema,
-          end: pointSchema,
+          startRef: refSchema.optional(),
+          endRef: refSchema.optional(),
+          start: pointSchema.optional(),
+          end: pointSchema.optional(),
           durationMs: z.number().int().min(1).max(60_000).default(300),
         }),
         outputSchema: envelopeOutputSchema,
         annotations: mutationAnnotations,
       },
-      async ({ serial, displayId, start, end, durationMs }, ctx) => {
+      async (
+        { serial, displayId, startRef, endRef, start, end, durationMs },
+        ctx,
+      ) => {
+        const from = resolveGesturePoint(
+          uiRefs,
+          serial,
+          displayId,
+          startRef,
+          start?.x,
+          start?.y,
+        );
+        const to = resolveGesturePoint(
+          uiRefs,
+          serial,
+          displayId,
+          endRef,
+          end?.x,
+          end?.y,
+        );
         const result = await controller.dragAndDrop(
           serial,
           displayId,
-          start,
-          end,
+          { x: from.x, y: from.y },
+          { x: to.x, y: to.y },
           durationMs,
           ctx.mcpReq.signal,
         );
@@ -1370,16 +1618,37 @@ export function createPolyScreenRuntime(
       {
         title: "Type Android text",
         description:
-          "Type text through ADB's virtual keyboard. Reports the Unicode limitation instead of hiding it.",
+          "Type text through ADB's virtual keyboard. Pass ref to tap that node first. Reports the Unicode limitation instead of hiding it.",
         inputSchema: z.object({
           serial: serialSchema,
           displayId: displayIdSchema,
+          ref: refSchema.optional(),
           text: z.string().max(10_000),
         }),
         outputSchema: envelopeOutputSchema,
         annotations: mutationAnnotations,
       },
-      async ({ serial, displayId, text }, ctx) => {
+      async ({ serial, displayId, ref, text }, ctx) => {
+        if (ref) {
+          const point = resolveGesturePoint(
+            uiRefs,
+            serial,
+            displayId,
+            ref,
+            undefined,
+            undefined,
+          );
+          const result = await controller.tapAndType(
+            serial,
+            displayId,
+            point.x,
+            point.y,
+            text,
+            ctx.mcpReq.signal,
+          );
+          result.warnings.push(`Tapped ${ref} before typing`);
+          return { content: jsonContent(result), structuredContent: result };
+        }
         const result = await controller.inputText(
           serial,
           displayId,
@@ -1572,6 +1841,278 @@ export function createPolyScreenRuntime(
           keepData,
           ctx.mcpReq.signal,
         );
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
+      "mobile_app_foreground",
+      {
+        title: "Read the foreground Android app",
+        description:
+          "Return the focused package and activity for one logical display. Window focus is preferred; activity tops are the fallback.",
+        inputSchema: z.object({
+          serial: serialSchema,
+          displayId: displayIdSchema.default(0),
+        }),
+        outputSchema: z.object({
+          serial: z.string(),
+          displayId: z.number(),
+          source: z.enum(["window-focus", "activity-top", "none"]),
+          packageName: z.string().optional(),
+          activity: z.string().optional(),
+          taskId: z.number().optional(),
+          focusedWindow: z.string().optional(),
+        }),
+        annotations: readAnnotations,
+      },
+      async ({ serial, displayId }, ctx) => {
+        const result = await controller.foregroundApp(
+          serial,
+          displayId,
+          ctx.mcpReq.signal,
+        );
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
+      "mobile_open_url",
+      {
+        title: "Open an http(s) URL",
+        description:
+          "Start ACTION_VIEW for an http or https URL on one logical display. Other schemes are rejected.",
+        inputSchema: z.object({
+          serial: serialSchema,
+          displayId: displayIdSchema.default(0),
+          url: z.string().min(1).max(2048),
+        }),
+        outputSchema: z.object({
+          url: z.string(),
+          output: z.string(),
+        }),
+        annotations: mutationAnnotations,
+      },
+      async ({ serial, displayId, url }, ctx) => {
+        await controller.requireDevice(serial, ctx.mcpReq.signal);
+        const result = await deviceActions.openUrl(
+          serial,
+          displayId,
+          url,
+          ctx.mcpReq.signal,
+        );
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
+      "mobile_orientation",
+      {
+        title: "Get or lock display rotation",
+        description:
+          "Read or set user rotation for one logical display. action lock uses rotation 0, 1, 2, or 3. action free lets the accelerometer decide. action get returns free or lock N, plus observedRotation from the live display when it is known.",
+        inputSchema: z.object({
+          serial: serialSchema,
+          displayId: displayIdSchema.default(0),
+          action: z.enum(["get", "lock", "free"]).default("get"),
+          rotation: z.number().int().min(0).max(3).optional(),
+        }),
+        outputSchema: z.object({
+          displayId: z.number(),
+          mode: z.enum(["free", "lock"]),
+          rotation: z.number().optional(),
+          observedRotation: z.number().optional(),
+          raw: z.string().optional(),
+        }),
+        annotations: mutationAnnotations,
+      },
+      async ({ serial, displayId, action, rotation }, ctx) => {
+        await controller.requireDevice(serial, ctx.mcpReq.signal);
+        if (action !== "get") {
+          const result = await deviceActions.setOrientation(
+            serial,
+            displayId,
+            action,
+            rotation,
+            ctx.mcpReq.signal,
+          );
+          return { content: jsonContent(result), structuredContent: result };
+        }
+        const orientation = await deviceActions.getOrientation(
+          serial,
+          displayId,
+          ctx.mcpReq.signal,
+        );
+        const displays = await controller.listDisplays(
+          serial,
+          ctx.mcpReq.signal,
+        );
+        const observed = displays.find(
+          (display) => display.logicalId === displayId,
+        );
+        const result = {
+          ...orientation,
+          ...(typeof observed?.rotation === "number"
+            ? { observedRotation: observed.rotation }
+            : {}),
+        };
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
+      "mobile_device_fold",
+      {
+        title: "Read or set fold state",
+        description:
+          "List cmd device_state postures and, when state is set, switch to a name such as OPEN or CLOSED or a numeric identifier. Non-foldables return foldable false.",
+        inputSchema: z.object({
+          serial: serialSchema,
+          state: z.string().min(1).max(64).optional(),
+        }),
+        outputSchema: z.object({
+          foldable: z.boolean().optional(),
+          states: z
+            .array(
+              z.object({
+                identifier: z.number(),
+                name: z.string().optional(),
+              }),
+            )
+            .optional(),
+          currentId: z.number().optional(),
+          currentName: z.string().optional(),
+          identifier: z.number().optional(),
+          name: z.string().optional(),
+          reason: z.string().optional(),
+        }),
+        annotations: mutationAnnotations,
+      },
+      async ({ serial, state }, ctx) => {
+        await controller.requireDevice(serial, ctx.mcpReq.signal);
+        const result = state
+          ? await deviceActions.setFold(serial, state, ctx.mcpReq.signal)
+          : await deviceActions.getFold(serial, ctx.mcpReq.signal);
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
+      "mobile_location",
+      {
+        title: "Set or clear a mock location",
+        description:
+          "On an emulator, set uses adb emu geo fix (longitude then latitude). Clearing an emulator fix fails because the console has no clear. On a device, set requires Android 12 (API 31) and injects a gps test provider via cmd location. Fused location clients can ignore that provider. clear removes it.",
+        inputSchema: z.object({
+          serial: serialSchema,
+          action: z.enum(["set", "clear"]).default("set"),
+          latitude: z.number().optional(),
+          longitude: z.number().optional(),
+          accuracyMeters: z.number().positive().max(10_000).default(10),
+        }),
+        outputSchema: z.object({
+          backend: z.enum(["emulator", "test-provider"]).optional(),
+          latitude: z.number().optional(),
+          longitude: z.number().optional(),
+          cleared: z.boolean().optional(),
+          warning: z.string().optional(),
+        }),
+        annotations: mutationAnnotations,
+      },
+      async ({ serial, action, latitude, longitude, accuracyMeters }, ctx) => {
+        await controller.requireDevice(serial, ctx.mcpReq.signal);
+        if (action === "clear") {
+          const result = await deviceActions.clearLocation(
+            serial,
+            ctx.mcpReq.signal,
+          );
+          return { content: jsonContent(result), structuredContent: result };
+        }
+        if (latitude === undefined || longitude === undefined) {
+          throw new Error("set requires latitude and longitude");
+        }
+        const result = await deviceActions.setLocation(
+          serial,
+          latitude,
+          longitude,
+          accuracyMeters,
+          ctx.mcpReq.signal,
+        );
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
+
+    server.registerTool(
+      "mobile_clipboard",
+      {
+        title: "Read or write the Android clipboard",
+        description:
+          "Read dumpsys clipboard, then cmd clipboard get when the dump is redacted. set uses cmd clipboard set. When the shell cannot read or write, an active companion session uses ClipboardManager. Without a companion, the result says the read was denied and names the companion. An empty string is returned only when a read can see that the clipboard is empty. A clip the companion cannot see stays readable false.",
+        inputSchema: z.object({
+          serial: serialSchema,
+          action: z.enum(["get", "set"]).default("get"),
+          text: z.string().max(8_000).optional(),
+        }),
+        outputSchema: z.object({
+          readable: z.boolean().optional(),
+          text: z.string().optional(),
+          redacted: z.boolean().optional(),
+          reason: z.string().optional(),
+          set: z.boolean().optional(),
+          backend: z.string().optional(),
+        }),
+        annotations: mutationAnnotations,
+      },
+      async ({ serial, action, text }, ctx) => {
+        await controller.requireDevice(serial, ctx.mcpReq.signal);
+        if (action === "set") {
+          if (text === undefined) throw new Error("set requires text");
+          try {
+            const result = await deviceActions.setClipboard(
+              serial,
+              text,
+              ctx.mcpReq.signal,
+            );
+            return { content: jsonContent(result), structuredContent: result };
+          } catch (error) {
+            if (!clipboardNeedsCompanion(error)) throw error;
+            if (!companion.isActive(serial)) {
+              throw new Error(
+                `${errorMessage(error)} Start the companion to write the clipboard.`,
+                { cause: error },
+              );
+            }
+            await companion.clipboard(serial, "set", text, ctx.mcpReq.signal);
+            const result = { set: true, backend: "companion" };
+            return { content: jsonContent(result), structuredContent: result };
+          }
+        }
+        const adbRead = await deviceActions.getClipboard(
+          serial,
+          ctx.mcpReq.signal,
+        );
+        if (adbRead.readable) {
+          return { content: jsonContent(adbRead), structuredContent: adbRead };
+        }
+        if (companion.isActive(serial)) {
+          const raw = await companion.clipboard(
+            serial,
+            "get",
+            undefined,
+            ctx.mcpReq.signal,
+          );
+          const result = {
+            readable: raw.readable === true,
+            ...(typeof raw.text === "string" ? { text: raw.text } : {}),
+            ...(typeof raw.reason === "string" ? { reason: raw.reason } : {}),
+            backend: "companion",
+          };
+          return { content: jsonContent(result), structuredContent: result };
+        }
+        const result = {
+          ...adbRead,
+          reason: `${adbRead.reason ?? "Clipboard was not readable."} Start the companion to read it.`,
+        };
         return { content: jsonContent(result), structuredContent: result };
       },
     );
@@ -1876,6 +2417,74 @@ export function createPolyScreenRuntime(
               ctx.mcpReq.signal,
             ),
           };
+          return { content: jsonContent(result), structuredContent: result };
+        },
+      );
+
+      server.registerTool(
+        "mobile_crashes_list",
+        {
+          title: "List Android crash reports",
+          description:
+            "List recent dropbox entries whose tags are crash, ANR, or tombstone. Newest first. Each entry has an id for mobile_crash_get.",
+          inputSchema: z.object({
+            serial: serialSchema,
+            limit: z.number().int().min(1).max(100).default(20),
+          }),
+          outputSchema: z.object({
+            entries: z.array(
+              z.object({
+                id: z.string(),
+                time: z.string(),
+                tag: z.string(),
+                detail: z.string().optional(),
+              }),
+            ),
+            truncated: z.boolean(),
+          }),
+          annotations: readAnnotations,
+        },
+        async ({ serial, limit }, ctx) => {
+          await controller.requireDevice(serial, ctx.mcpReq.signal);
+          const result = await deviceActions.listCrashes(
+            serial,
+            limit,
+            ctx.mcpReq.signal,
+          );
+          return { content: jsonContent(result), structuredContent: result };
+        },
+      );
+
+      server.registerTool(
+        "mobile_crash_get",
+        {
+          title: "Read an Android crash report",
+          description:
+            "Print one dropbox crash, ANR, or tombstone. Pass id from mobile_crashes_list, or a tag to read the newest entry for that tag. The body is one entry, capped by maxChars.",
+          inputSchema: z.object({
+            serial: serialSchema,
+            id: z.string().min(1).max(256).optional(),
+            tag: z.string().min(1).max(128).optional(),
+            maxChars: z.number().int().min(200).max(200_000).default(20_000),
+          }),
+          outputSchema: z.object({
+            id: z.string(),
+            tag: z.string(),
+            time: z.string(),
+            text: z.string(),
+            truncated: z.boolean(),
+          }),
+          annotations: readAnnotations,
+        },
+        async ({ serial, id, tag, maxChars }, ctx) => {
+          await controller.requireDevice(serial, ctx.mcpReq.signal);
+          if (!id && !tag) throw new Error("Pass id or tag");
+          const result = await deviceActions.getCrash(
+            serial,
+            { id, tag },
+            maxChars,
+            ctx.mcpReq.signal,
+          );
           return { content: jsonContent(result), structuredContent: result };
         },
       );
@@ -2463,6 +3072,82 @@ export function createPolyScreenRuntime(
         },
       );
     }
+
+    server.registerTool(
+      "mobile_batch",
+      {
+        title: "Run several Android tools in order",
+        description:
+          "Call other registered tools in one request. Each step is validated with that tool's schema. Nested mobile_batch, screenshots, and blocking screen records are rejected. stopOnError ends the sequence at the first failure.",
+        inputSchema: z.object({
+          steps: z
+            .array(
+              z.object({
+                name: z.string().regex(/^mobile_[a-z0-9_]+$/),
+                arguments: z.record(z.string(), z.unknown()).default({}),
+              }),
+            )
+            .min(1)
+            .max(16),
+          stopOnError: z.boolean().default(true),
+        }),
+        outputSchema: z.object({
+          results: z.array(
+            z.object({
+              name: z.string(),
+              ok: z.boolean(),
+              data: z.unknown().optional(),
+              error: z.string().optional(),
+            }),
+          ),
+        }),
+        annotations: mutationAnnotations,
+      },
+      async ({ steps, stopOnError }, ctx) => {
+        const results: Array<{
+          name: string;
+          ok: boolean;
+          data?: unknown;
+          error?: string;
+        }> = [];
+        for (const step of steps) {
+          if (BATCH_EXCLUDED.has(step.name)) {
+            const error = `${step.name} cannot run inside mobile_batch`;
+            results.push({ name: step.name, ok: false, error });
+            if (stopOnError) break;
+            continue;
+          }
+          const registered = toolHandlers.get(step.name);
+          if (!registered) {
+            const error = `Unknown tool: ${step.name}`;
+            results.push({ name: step.name, ok: false, error });
+            if (stopOnError) break;
+            continue;
+          }
+          try {
+            const args = registered.schema.parse(step.arguments) as Record<
+              string,
+              unknown
+            >;
+            const response = await registered.handler(args, ctx);
+            results.push({
+              name: step.name,
+              ok: true,
+              data: response.structuredContent,
+            });
+          } catch (error) {
+            results.push({
+              name: step.name,
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            if (stopOnError) break;
+          }
+        }
+        const result = { results };
+        return { content: jsonContent(result), structuredContent: result };
+      },
+    );
 
     const toolNames = listedTools();
     cachedToolNames = toolNames;

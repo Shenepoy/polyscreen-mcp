@@ -134,16 +134,16 @@ stdio يبقى الافتراضي. الخادم يتحدث MCP <span dir="ltr"><
 
 </div>
 
-| Profile        | القدرات                                                                                                      |
-| -------------- | ------------------------------------------------------------------------------------------------------------ |
-| `core`         | معلومات الخادم، الأجهزة، الشاشات، لقطات، تسجيل/تحليل غير متزامن، focus traces، artifacts، UI، إدخال، تطبيقات |
-| `apps`         | الحزم، أدوار التطبيقات الافتراضية، الإشعارات، وبث محدود                                                      |
-| `diagnostics`  | شرائح dumpsys، logcat، إيقاظ، وضع الليل، قراءة shared_prefs للتطبيقات القابلة للتصحيح                        |
-| `files`        | دفع/سحب مقيّد تحت جذور معتمدة                                                                                |
-| `performance`  | لقطات CPU والطاقة والبطارية والذاكرة والإطارات                                                               |
-| `device-admin` | منح/سحب أذونات وقت التشغيل صراحةً                                                                            |
-| `companion`    | نوافذ accessibility لكل الشاشات ومفاتيح press/down/up صريحة                                                  |
-| `all`          | كل الملفات المنفَّذة                                                                                         |
+| Profile        | القدرات                                                                                                                                   |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `core`         | معلومات الخادم، الأجهزة، الشاشات، لقطات، تسجيل/تحليل غير متزامن، focus traces، artifacts، UI، إدخال، تطبيقات                              |
+| `apps`         | الحزم، أدوار التطبيقات الافتراضية، الإشعارات، وبث محدود                                                                                   |
+| `diagnostics`  | شرائح dumpsys، activity tops، layer hints، قائمة الأعطال وقراءتها، logcat، إيقاظ، وضع الليل، قراءة shared_prefs للتطبيقات القابلة للتصحيح |
+| `files`        | دفع/سحب مقيّد تحت جذور معتمدة                                                                                                             |
+| `performance`  | لقطات CPU والطاقة والبطارية والذاكرة والإطارات                                                                                            |
+| `device-admin` | منح/سحب أذونات وقت التشغيل صراحةً                                                                                                         |
+| `companion`    | نوافذ accessibility لكل الشاشات ومفاتيح press/down/up صريحة                                                                               |
+| `all`          | كل الملفات المنفَّذة                                                                                                                      |
 
 <div dir="rtl" lang="ar">
 
@@ -162,7 +162,7 @@ stdio يبقى الافتراضي. الخادم يتحدث MCP <span dir="ltr"><
 </div>
 
 ```text
-npx -y polyscreen-mcp@0.8.0 --profile core diagnostics
+npx -y polyscreen-mcp@0.9.0 --profile core diagnostics
 ```
 
 <div dir="rtl" lang="ar">
@@ -196,7 +196,7 @@ npx -y polyscreen-mcp@0.8.0 --profile core diagnostics
   "mcpServers": {
     "polyscreen": {
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.9.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -216,7 +216,7 @@ npx -y polyscreen-mcp@0.8.0 --profile core diagnostics
     "polyscreen": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.9.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -232,7 +232,7 @@ npx -y polyscreen-mcp@0.8.0 --profile core diagnostics
 
 ```yaml
 name: PolyScreen MCP
-version: 0.8.0
+version: 0.9.0
 schema: v1
 mcpServers:
   - name: polyscreen
@@ -240,7 +240,7 @@ mcpServers:
     command: npx
     args:
       - -y
-      - polyscreen-mcp@0.8.0
+      - polyscreen-mcp@0.9.0
       - --profile
       - core
       - diagnostics
@@ -259,7 +259,7 @@ mcpServers:
   "context_servers": {
     "polyscreen": {
       "command": "npx",
-      "args": ["-y", "polyscreen-mcp@0.8.0", "--profile", "core", "diagnostics"]
+      "args": ["-y", "polyscreen-mcp@0.9.0", "--profile", "core", "diagnostics"]
     }
   }
 }
@@ -298,8 +298,10 @@ polyscreen-mcp --listen 3300 --token "replace-with-a-secret"
 - `mobile_theme_flash_report`
 - `mobile_focus_trace` / `mobile_focus_trace_start` / `mobile_focus_trace_stop`
 - `mobile_artifacts_list` / `mobile_artifacts_prune`
-- `mobile_ui_snapshot` / `mobile_ui_find` / `mobile_ui_wait`
-- `mobile_input_tap` / `mobile_input_swipe` / `mobile_input_drag`
+- `mobile_ui_snapshot` / `mobile_ui_find` / `mobile_ui_wait` — `ref` (`@nN`)
+- `mobile_input_tap` / `mobile_input_double_tap` / `mobile_input_long_press` / `mobile_input_swipe` / `mobile_input_drag`
+- `mobile_batch`
+- `mobile_app_foreground` / `mobile_open_url` / `mobile_orientation` / `mobile_device_fold` / `mobile_location` / `mobile_clipboard`
 - `mobile_input_key` / `mobile_input_key_sequence` / `mobile_input_key_combination` / `mobile_input_text`. <span dir="ltr"><code>mobile_input_key_sequence</code></span> يرسل تسلسلًا موقوتًا: الأرقام بين الأفعال توقف بالملي ثانية وليست ضغطة متزامنة، و<span dir="ltr"><code>x,y</code></span> نقرة (<span dir="ltr"><code>x,y+x,y</code></span> لمسة مركّبة بلا توقف بين النقاط). <span dir="ltr"><code>stepped.checks</code></span> ينفّذ كل فعل على حدة وينتظر ظهور عنصر واجهة قبل الفعل التالي.
 - `mobile_app_inspect` / `mobile_app_launch` / `mobile_app_stop` / `mobile_app_relaunch_on_displays`
 - `mobile_app_install` / `mobile_app_uninstall`
